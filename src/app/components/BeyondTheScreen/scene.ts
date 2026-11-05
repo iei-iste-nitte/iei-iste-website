@@ -1,702 +1,463 @@
-
 import * as THREE from "three";
+import { createTerminal, SCREEN_ASPECT } from "./terminal";
+import { createRoom, SCREEN_W, SCREEN_H } from "./room";
+import { createDigitalWorld, DEPTH_MAX } from "./digital";
+import { disposeObject, smoothstep } from "./util";
 
-export function createScene(container: HTMLDivElement) {
-  // =====================================
-  // SCENE, CAMERA AND RENDERER
-  // =====================================
+/**
+ * Scroll-driven state. Each field is owned by exactly one tween so the two
+ * ScrollTrigger timelines can never fight over the same property.
+ */
+export interface JourneyState {
+  door: number; // 0..1  door swing
+  walk: number; // 0..1  camera path from hallway to the laptop
+  approach: number; // 0..1  dolly onto the screen's normal axis
+  mix: number; // 0..1  terminal -> digital world dissolve on the screen
+  depthPre: number; // 0..PRE  digital camera drift while still inside the screen
+  depthMain: number; // 0..(DEPTH_MAX-PRE)  travel after the portal swap
+}
 
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color("#050706");
-  scene.fog = new THREE.Fog("#050706", 18, 65);
+export const DEPTH_PRE_MAX = 10;
+export const DEPTH_MAIN_MAX = DEPTH_MAX - DEPTH_PRE_MAX;
 
-  const camera = new THREE.PerspectiveCamera(
-    48,
-    window.innerWidth / window.innerHeight,
-    0.1,
-    150
-  );
+const RT_FOV = 58;
 
-  camera.position.set(0, 2.1, 10);
-  camera.lookAt(0, 1.5, 0);
+/** Rendering budget. Desktop values are the original, unchanged settings. */
+interface QualityProfile {
+  mobile: boolean;
+  maxPixelRatio: number;
+  density: number; // particles / panels / wireframes (1 = full)
+  shadows: boolean;
+  rtWidth: number; // portal render-target width
+  rtSamples: number; // portal MSAA samples
+  terminalInterval: number; // seconds between terminal redraws
+}
 
+const DESKTOP: QualityProfile = {
+  mobile: false, maxPixelRatio: 1.25, density: 1, shadows: true,
+  rtWidth: 1536, rtSamples: 4, terminalInterval: 0.07,
+};
+const MOBILE: QualityProfile = {
+  mobile: true, maxPixelRatio: 1, density: 0.35, shadows: false,
+  rtWidth: 768, rtSamples: 2, terminalInterval: 0.1,
+};
+
+function detectProfile(): QualityProfile {
+  const narrow = window.matchMedia("(max-width: 820px)").matches;
+  const coarse = window.matchMedia("(pointer: coarse)").matches;
+  const smallSide = Math.min(window.innerWidth, window.innerHeight) <= 820;
+  return narrow || (coarse && smallSide) ? MOBILE : DESKTOP;
+}
+const rad = THREE.MathUtils.degToRad;
+const deg = THREE.MathUtils.radToDeg;
+
+const SCREEN_VERT = /* glsl */ `
+  varying vec2 vUv;
+  void main() {
+    vUv = uv;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const SCREEN_FRAG = /* glsl */ `
+  uniform sampler2D uTerm;
+  uniform sampler2D uDig;
+  uniform float uMix;
+  uniform float uTime;
+  varying vec2 vUv;
+
+  void main() {
+    vec2 uv = vUv;
+    vec2 p = (uv - 0.5) * vec2(1.6, 1.0);
+    float r = length(p);
+
+    float edge = uMix * 1.3;
+    float w = 0.14;
+    float inside = 1.0 - smoothstep(edge - w, edge, r);
+    float going = step(0.001, uMix) * (1.0 - step(0.999, uMix));
+    float ring = exp(-pow((r - edge + w * 0.5) / (w * 0.55), 2.0)) * going;
+
+    vec2 dir = normalize(p + vec2(1e-5));
+    vec2 off = dir * 0.006 * ring;
+    vec3 dig = vec3(
+      texture2D(uDig, uv + off).r,
+      texture2D(uDig, uv).g,
+      texture2D(uDig, uv - off).b
+    );
+    vec3 term = texture2D(uTerm, uv).rgb;
+
+    vec3 col = mix(term, dig, inside);
+    col += vec3(0.03, 0.22, 0.16) * ring;
+
+    // glass / CRT feel, fully faded once the portal has opened
+    float fx = 1.0 - uMix;
+    float scan = 0.955 + 0.045 * sin(uv.y * 780.0 + uTime * 2.0);
+    float vig = 1.0 - 0.35 * smoothstep(0.35, 0.95, r);
+    col *= mix(1.0, scan * vig, fx);
+
+    gl_FragColor = vec4(col, 1.0);
+    #include <colorspace_fragment>
+  }
+`;
+
+export function createScene(container: HTMLElement) {
+  // ---------- Renderer ----------
   const renderer = new THREE.WebGLRenderer({
     antialias: true,
     alpha: false,
+    powerPreference: "high-performance",
   });
-
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
-  renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 0.85;
+  renderer.toneMappingExposure = 1.1;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFShadowMap;
 
-  // =====================================
-  // MATERIALS
-  // =====================================
+  const canvas = renderer.domElement;
+  canvas.addEventListener("webglcontextlost", (e) => e.preventDefault());
 
-  const wallMat = new THREE.MeshStandardMaterial({
-    color: "#101310",
-    roughness: 0.95,
+  const size = () => ({
+    w: Math.max(1, container.clientWidth || window.innerWidth),
+    h: Math.max(1, container.clientHeight || window.innerHeight),
   });
 
-  const darkMat = new THREE.MeshStandardMaterial({
-    color: "#080a09",
-    roughness: 0.9,
-  });
-
-  const floorMat = new THREE.MeshStandardMaterial({
-    color: "#0b0e0c",
-    roughness: 0.55,
-    metalness: 0.15,
-  });
-
-  const doorMat = new THREE.MeshStandardMaterial({
-    color: "#191a17",
-    roughness: 0.82,
-    metalness: 0.12,
-  });
-
-  const doorPanelMat = new THREE.MeshStandardMaterial({
-    color: "#10120f",
-    roughness: 0.9,
-  });
-
-  const metalMat = new THREE.MeshStandardMaterial({
-    color: "#343b36",
-    metalness: 0.55,
-    roughness: 0.42,
-  });
-
-  const silhouetteMat = new THREE.MeshStandardMaterial({
-    color: "#050706",
-    roughness: 1,
-  });
-
-  const mutedGreen = "#527d61";
-  const softGreen = "#78a88a";
-
-  // =====================================
-  // HELPERS
-  // =====================================
-
-  function addBox(
-    parent: THREE.Group,
-    size: [number, number, number],
-    position: [number, number, number],
-    material: THREE.Material
-  ) {
-    const mesh = new THREE.Mesh(
-      new THREE.BoxGeometry(...size),
-      material
-    );
-
-    mesh.position.set(...position);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
-    parent.add(mesh);
-
-    return mesh;
-  }
-
-  function addLine(
-    parent: THREE.Group,
-    points: THREE.Vector3[],
-    color: string,
-    opacity = 0.35
-  ) {
-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
-
-    const material = new THREE.LineBasicMaterial({
-      color,
-      transparent: true,
-      opacity,
-    });
-
-    const line = new THREE.Line(geometry, material);
-    parent.add(line);
-
-    return line;
-  }
-
-  // =====================================
-  // MAIN ROOM
-  // =====================================
-
-  const room = new THREE.Group();
-  scene.add(room);
-
-  addBox(room, [18, 0.2, 30], [0, -0.12, -8], floorMat);
-  addBox(room, [18, 7, 0.2], [0, 3.4, -22], wallMat);
-  addBox(room, [0.2, 7, 30], [-9, 3.4, -8], wallMat);
-  addBox(room, [0.2, 7, 30], [9, 3.4, -8], wallMat);
-  addBox(room, [18, 0.2, 30], [0, 7, -8], darkMat);
-
-  // Subtle floor lighting strips
-  const floorStripMat = new THREE.MeshBasicMaterial({
-    color: "#31533c",
-    toneMapped: false,
-  });
-
-  addBox(room, [7, 0.025, 0.035], [0, 0.015, -1], floorStripMat);
-  addBox(room, [7, 0.025, 0.035], [0, 0.015, -13], floorStripMat);
-
-  // =====================================
-  // DOOR AND FRAME
-  // =====================================
-
-  const doorFrame = new THREE.Group();
-  doorFrame.position.set(0, 0, 1);
-  room.add(doorFrame);
-
-  addBox(doorFrame, [0.18, 4.4, 0.3], [-1.65, 2.2, 0], metalMat);
-  addBox(doorFrame, [0.18, 4.4, 0.3], [1.65, 2.2, 0], metalMat);
-  addBox(doorFrame, [3.5, 0.18, 0.3], [0, 4.4, 0], metalMat);
-
-  const doorPivot = new THREE.Group();
-  doorPivot.position.set(-1.52, 0, 1.05);
-  room.add(doorPivot);
-
-  addBox(
-    doorPivot,
-    [3.05, 4.15, 0.14],
-    [1.525, 2.075, 0],
-    doorMat
-  );
-
-  // Recessed door panels
-  addBox(
-    doorPivot,
-    [2.55, 1.55, 0.035],
-    [1.525, 3.05, 0.09],
-    doorPanelMat
-  );
-
-  addBox(
-    doorPivot,
-    [2.55, 1.25, 0.035],
-    [1.525, 1.25, 0.09],
-    doorPanelMat
-  );
-
-  // Door handle
-  const handle = new THREE.Mesh(
-    new THREE.SphereGeometry(0.065, 16, 16),
-    metalMat
-  );
-
-  handle.position.set(2.7, 2.05, 0.14);
-  doorPivot.add(handle);
-
-  // Hinges
-  [0.6, 2.1, 3.6].forEach((y) => {
-    addBox(
-      doorPivot,
-      [0.1, 0.25, 0.22],
-      [0.05, y, 0],
-      metalMat
-    );
-  });
-
-  // Muted green edge light
-  const doorEdgeMat = new THREE.MeshBasicMaterial({
-    color: "#42694e",
-    toneMapped: false,
-  });
-
-  addBox(doorFrame, [0.035, 3.9, 0.025], [-1.49, 2.1, 0.18], doorEdgeMat);
-
-  // =====================================
-  // DESK
-  // =====================================
-
-  const desk = new THREE.Group();
-  desk.position.set(0, 0, -6.2);
-  room.add(desk);
-
-  addBox(desk, [4.5, 0.16, 1.8], [0, 1.55, 0], darkMat);
-
-  [-1.9, 1.9].forEach((x) => {
-    addBox(desk, [0.12, 1.5, 0.12], [x, 0.78, 0], metalMat);
-  });
-
-  // =====================================
-  // LAPTOP
-  // =====================================
-
-  const laptop = new THREE.Group();
-  laptop.position.set(0, 1.65, -0.3);
-  desk.add(laptop);
-
-  // Keyboard base
-  addBox(laptop, [1.9, 0.08, 1.25], [0, 0, 0], metalMat);
-
-  // Keyboard surface
-  addBox(
-    laptop,
-    [1.65, 0.012, 0.72],
-    [0, 0.048, 0.2],
-    darkMat
-  );
-
-  // Keyboard keys
-  const keyMat = new THREE.MeshBasicMaterial({
-    color: "#31543d",
-    toneMapped: false,
-  });
-
-  for (let row = 0; row < 4; row++) {
-    for (let col = 0; col < 13; col++) {
-      addBox(
-        laptop,
-        [0.085, 0.012, 0.09],
-        [-0.75 + col * 0.125, 0.058, -0.05 + row * 0.16],
-        keyMat
-      );
+  // ---------- Portal render target (digital world seen through the screen) ----------
+  const floatOk =
+    renderer.extensions.has("EXT_color_buffer_float") ||
+    renderer.extensions.has("EXT_color_buffer_half_float");
+  let profile = detectProfile();
+  const rt = new THREE.WebGLRenderTarget(
+    profile.rtWidth,
+    Math.round(profile.rtWidth / SCREEN_ASPECT),
+    {
+      samples: profile.rtSamples,
+      type: floatOk ? THREE.HalfFloatType : THREE.UnsignedByteType,
     }
-  }
-
-  // Laptop screen frame
-  addBox(
-    laptop,
-    [1.9, 1.25, 0.07],
-    [0, 0.64, -0.57],
-    darkMat
   );
 
-  // =====================================
-  // LAPTOP TERMINAL DISPLAY
-  // =====================================
+  // ---------- Content ----------
+  const terminal = createTerminal();
+  terminal.texture.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
 
-  const codeCanvas = document.createElement("canvas");
-  codeCanvas.width = 1024;
-  codeCanvas.height = 640;
+  const screenMaterial = new THREE.ShaderMaterial({
+    vertexShader: SCREEN_VERT,
+    fragmentShader: SCREEN_FRAG,
+    toneMapped: false,
+    uniforms: {
+      uTerm: { value: terminal.texture },
+      uDig: { value: rt.texture },
+      uMix: { value: 0 },
+      uTime: { value: 0 },
+    },
+  });
 
-  const ctx = codeCanvas.getContext("2d");
+  const room = createRoom(screenMaterial);
+  const digital = createDigitalWorld();
 
-  let terminalFrame = 0;
+  const roomScene = new THREE.Scene();
+  roomScene.background = new THREE.Color("#030504");
+  roomScene.fog = new THREE.FogExp2("#030504", 0.045);
+  roomScene.add(room.group);
 
-  const terminalMessages = [
-    "> INITIALIZING SECURE SESSION",
-    "[OK] NETWORK MODULE LOADED",
-    "[OK] ENCRYPTION LAYER ACTIVE",
-    "const system = await connect();",
-    "function authenticate(user) {",
-    "  return verifyIdentity(user);",
-    "}",
-    "[INFO] SCANNING ENVIRONMENT...",
-    "[OK] DATABASE CONNECTION",
-    "[OK] ACCESS TOKEN VERIFIED",
-    "const status = 'ONLINE';",
-    "loadSystemModules();",
-    "executeProcess();",
-    "[OK] SYSTEM ACCESS GRANTED",
-  ];
+  // Dim studio environment so metal and the polished floor have something to reflect
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  const envScene = new THREE.Scene();
+  envScene.add(
+    new THREE.Mesh(
+      new THREE.BoxGeometry(12, 6, 14),
+      new THREE.MeshBasicMaterial({ color: "#040706", side: THREE.BackSide })
+    )
+  );
+  const envPanel = (color: string, gain: number, w: number, h: number, pos: [number, number, number], rot: [number, number, number]) => {
+    const m = new THREE.Mesh(
+      new THREE.PlaneGeometry(w, h),
+      new THREE.MeshBasicMaterial({ color: new THREE.Color(color).multiplyScalar(gain), side: THREE.DoubleSide })
+    );
+    m.position.set(...pos);
+    m.rotation.set(...rot);
+    envScene.add(m);
+  };
+  envPanel("#b4cbc2", 5, 5, 1.2, [0, 2.8, 0], [Math.PI / 2, 0, 0]);
+  envPanel("#2f8f6c", 3, 6, 0.6, [-5.9, 1.2, 0], [0, Math.PI / 2, 0]);
+  envPanel("#6f8f9a", 2, 3, 1.5, [5.9, 1.5, -2], [0, -Math.PI / 2, 0]);
+  const envTarget = pmrem.fromScene(envScene, 0.03);
+  roomScene.environment = envTarget.texture;
+  roomScene.environmentIntensity = 0.45;
+  disposeObject(envScene);
+  pmrem.dispose();
 
-  function drawTerminal() {
-    if (!ctx) return;
+  // ---------- Cameras ----------
+  const roomCam = new THREE.PerspectiveCamera(42, 1, 0.02, 40);
+  const digCam = new THREE.PerspectiveCamera(RT_FOV, SCREEN_ASPECT, 0.1, 900);
 
-    ctx.fillStyle = "#050907";
-    ctx.fillRect(0, 0, 1024, 640);
+  // ---------- Screen anchor (centre + outward normal) ----------
+  room.group.updateMatrixWorld(true);
+  const screenCenter = new THREE.Vector3();
+  room.screen.getWorldPosition(screenCenter);
+  const screenNormal = new THREE.Vector3(0, 0, 1)
+    .transformDirection(room.screen.matrixWorld)
+    .normalize();
 
-    // Header
-    ctx.fillStyle = "#0c1710";
-    ctx.fillRect(0, 0, 1024, 58);
+  // ---------- Walk path ----------
+  const walkCurve = new THREE.CatmullRomCurve3(
+    [
+      new THREE.Vector3(0.0, 1.5, 3.7),
+      new THREE.Vector3(0.0, 1.52, 2.0),
+      new THREE.Vector3(0.0, 1.52, 0.6),
+      new THREE.Vector3(-0.05, 1.5, -1.0),
+      new THREE.Vector3(-0.25, 1.38, -2.8),
+      new THREE.Vector3(screenCenter.x, 1.2, screenCenter.z + 1.85),
+    ],
+    false,
+    "centripetal"
+  );
+  const lookCurve = new THREE.CatmullRomCurve3(
+    [
+      new THREE.Vector3(0, 1.1, 0),
+      new THREE.Vector3(0, 1.15, -2.0),
+      new THREE.Vector3(0, 1.2, -4.0),
+      new THREE.Vector3(-0.1, 1.1, -5.5),
+      new THREE.Vector3(-0.3, 1.0, -6.4),
+      screenCenter.clone(),
+    ],
+    false,
+    "centripetal"
+  );
 
-    ctx.fillStyle = "#78a88a";
-    ctx.font = "bold 24px monospace";
-    ctx.fillText("SYSTEM BREACH PROTOCOL  //  v3.9", 30, 37);
+  const state: JourneyState = {
+    door: 0, walk: 0, approach: 0, mix: 0, depthPre: 0, depthMain: 0,
+  };
 
-    ctx.fillStyle = "#547d62";
-    ctx.font = "18px monospace";
-    ctx.fillText("USER: NAVSETU_", 780, 37);
+  const camPos = new THREE.Vector3();
+  const lookAt = new THREE.Vector3();
+  const pEnd = new THREE.Vector3();
+  const tmp = new THREE.Vector3();
 
-    // Main terminal frame
-    ctx.strokeStyle = "#31513b";
-    ctx.lineWidth = 2;
-    ctx.strokeRect(25, 78, 974, 520);
+  function poseRoomCamera() {
+    const w = THREE.MathUtils.clamp(state.walk, 0, 1);
+    walkCurve.getPoint(w, camPos);
+    lookCurve.getPoint(w, lookAt);
 
-    // Terminal section
-    ctx.fillStyle = "#91b49a";
-    ctx.font = "bold 22px monospace";
-    ctx.fillText("SECURE TERMINAL", 50, 118);
-
-    ctx.fillStyle = "#527d61";
-    ctx.font = "18px monospace";
-    ctx.fillText("LIVE SYSTEM LOG", 50, 151);
-
-    // Scrolling terminal lines
-    const offset = Math.floor(terminalFrame / 8);
-
-    ctx.font = "20px monospace";
-
-    for (let i = 0; i < 12; i++) {
-      const message =
-        terminalMessages[(i + offset) % terminalMessages.length];
-
-      ctx.fillStyle = i % 3 === 0 ? "#91b49a" : "#5e9870";
-      ctx.fillText(message, 52, 205 + i * 29);
+    // Portrait phones: the horizontal field of view is narrow, so stand a
+    // little further back at the door and walk closer to the laptop. This is
+    // zero for any landscape aspect, leaving desktop framing untouched.
+    const portrait = THREE.MathUtils.clamp((1 - roomCam.aspect) / 0.4, 0, 1);
+    if (portrait > 0) {
+      camPos.z += 0.8 * portrait * (1 - smoothstep(0, 0.3, w));
+      camPos.lerp(screenCenter, 0.16 * portrait * smoothstep(0.55, 1, w));
     }
 
-    // Right-side data panel
-    ctx.strokeStyle = "#31513b";
-    ctx.strokeRect(720, 170, 245, 160);
-
-    ctx.fillStyle = "#78a88a";
-    ctx.font = "bold 17px monospace";
-    ctx.fillText("NETWORK STATUS", 740, 199);
-
-    ctx.fillStyle = "#527d61";
-    ctx.font = "16px monospace";
-    ctx.fillText("PING: 024ms", 740, 235);
-    ctx.fillText("ENCRYPTION: AES", 740, 263);
-    ctx.fillText("CONNECTION: SAFE", 740, 291);
-
-    // Small waveform
-    ctx.beginPath();
-    ctx.strokeStyle = "#659b75";
-    ctx.lineWidth = 2;
-
-    for (let i = 0; i < 190; i++) {
-      const x = 745 + i;
-      const y =
-        405 +
-        Math.sin((i + terminalFrame * 2) * 0.12) * 12 +
-        Math.sin(i * 0.31) * 5;
-
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+    if (state.approach > 0) {
+      const e = THREE.MathUtils.clamp(state.approach, 0, 1);
+      const t = Math.tan(rad(roomCam.fov / 2));
+      const dFill =
+        0.985 * Math.min(SCREEN_W / (2 * t * roomCam.aspect), SCREEN_H / (2 * t));
+      pEnd.copy(screenCenter).addScaledVector(screenNormal, dFill);
+      camPos.lerp(pEnd, e);
+      camPos.y += Math.sin(Math.PI * e) * 0.02;
+      lookAt.lerp(screenCenter, e);
     }
+    // On wide screens, frame the door right of centre so the hero copy
+    // (left aligned) doesn't sit on top of it; eases out as we walk in.
+    const shift = THREE.MathUtils.clamp((roomCam.aspect - 1.15) * 1.2, 0, 0.85);
+    lookAt.x -= shift * (1 - smoothstep(0, 0.22, w)) * (1 - state.approach);
+    roomCam.position.copy(camPos);
+    roomCam.lookAt(lookAt);
+  }
 
-    ctx.stroke();
+  function poseDigitalCamera(depth: number) {
+    const sway = smoothstep(0, 60, depth);
+    const x = Math.sin(depth * 0.021) * 0.7 * sway;
+    const y = 0.4 + Math.sin(depth * 0.015 + 1) * 0.3 * sway;
+    digCam.position.set(x, y, -depth);
+    tmp.set(x * 0.4, 0.4 + (y - 0.4) * 0.5, -depth - 30);
+    digCam.up.set(0, 1, 0);
+    digCam.lookAt(tmp);
+    digCam.rotateZ(Math.sin(depth * 0.01) * 0.035 * sway);
+  }
 
-    // Bottom status bar
-    ctx.fillStyle = "#14241a";
-    ctx.fillRect(50, 550, 910, 18);
+  /** Vertical FOV for the full-screen digital camera: matches what the
+   *  screen showed at the moment of hand-off, then opens up gradually. */
+  function directFov(depth: number, aspect: number) {
+    const matched = deg(
+      2 * Math.atan(Math.tan(rad(RT_FOV / 2)) * Math.min(1, SCREEN_ASPECT / aspect))
+    );
+    const target = aspect < 1 ? 72 : 64;
+    return THREE.MathUtils.lerp(matched, target, smoothstep(DEPTH_PRE_MAX, 70, depth));
+  }
 
-    ctx.fillStyle = "#5e9870";
-    ctx.fillRect(50, 550, 910 * ((terminalFrame % 180) / 180), 18);
+  // ---------- Quality, resize ----------
+  // Adaptive fallback: if a phone sustains < ~33 fps we drop to 1x pixel
+  // ratio and a lighter scene. Never applies to the desktop profile.
+  let degraded = false;
+  let reducedMotion = false;
+  let needsFrame = true;
+  let qualityKey = "";
+  let rtHeight = Math.round(profile.rtWidth / SCREEN_ASPECT);
 
-    // Blinking cursor
-    if (Math.floor(terminalFrame / 25) % 2 === 0) {
-      ctx.fillStyle = "#a0c4a8";
-      ctx.fillRect(52, 590, 13, 22);
+  function applyQuality() {
+    profile = detectProfile();
+    const useLite = profile.mobile && degraded;
+    const key = `${profile.mobile}|${useLite}|${window.devicePixelRatio}`;
+    if (key === qualityKey) return;
+    qualityKey = key;
+
+    const pr = useLite
+      ? 1
+      : Math.min(window.devicePixelRatio || 1, profile.maxPixelRatio);
+    if (renderer.getPixelRatio() !== pr) renderer.setPixelRatio(pr);
+
+    digital.setQuality(profile.density * (useLite ? 0.7 : 1));
+    room.setQuality(profile.shadows);
+
+    const rtW = useLite ? 768 : profile.rtWidth;
+    if (rt.width !== rtW) {
+      rtHeight = Math.round(rtW / SCREEN_ASPECT);
+      rt.setSize(rtW, rtHeight);
     }
-
-    terminalFrame++;
-    codeTexture.needsUpdate = true;
+    if (rt.samples !== profile.rtSamples) {
+      rt.samples = profile.rtSamples;
+      rt.dispose(); // re-allocated lazily with the new sample count
+    }
+    needsFrame = true;
   }
 
-  const codeTexture = new THREE.CanvasTexture(codeCanvas);
-  codeTexture.colorSpace = THREE.SRGBColorSpace;
+  let lastW = 0;
+  let lastH = 0;
 
-  const codeScreen = new THREE.Mesh(
-    new THREE.PlaneGeometry(1.76, 1.1),
-    new THREE.MeshBasicMaterial({
-      map: codeTexture,
-      toneMapped: false,
-    })
-  );
-
-  codeScreen.position.set(0, 0.65, -0.505);
-  laptop.add(codeScreen);
-
-  drawTerminal();
-
-  // =====================================
-  // DEVELOPER SILHOUETTE
-  // =====================================
-
-  const developer = new THREE.Group();
-  developer.position.set(0, 0, -7.7);
-  room.add(developer);
-
-  addBox(developer, [1.3, 0.16, 1.2], [0, 1.05, 0.5], darkMat);
-  addBox(developer, [1.3, 1.8, 0.16], [0, 1.95, 1.05], darkMat);
-
-  const body = new THREE.Mesh(
-    new THREE.CapsuleGeometry(0.48, 0.95, 5, 12),
-    silhouetteMat
-  );
-
-  body.position.set(0, 2.05, 0.25);
-  body.rotation.x = -0.18;
-  developer.add(body);
-
-  const head = new THREE.Mesh(
-    new THREE.SphereGeometry(0.31, 20, 20),
-    silhouetteMat
-  );
-
-  head.position.set(0, 3.05, -0.18);
-  developer.add(head);
-
-  const armGeometry = new THREE.CapsuleGeometry(0.12, 0.8, 4, 8);
-
-  [-1, 1].forEach((side) => {
-    const arm = new THREE.Mesh(armGeometry, silhouetteMat);
-    arm.position.set(side * 0.52, 2.15, -0.25);
-    arm.rotation.z = side * -0.6;
-    developer.add(arm);
-  });
-
-  // =====================================
-  // DIGITAL WORLD - HIDDEN BEHIND SCREEN
-  // =====================================
-
-  const digitalWorld = new THREE.Group();
-  digitalWorld.visible = false;
-  scene.add(digitalWorld);
-
-  // Tunnel floor
-  const digitalFloor = new THREE.Mesh(
-    new THREE.PlaneGeometry(18, 55),
-    new THREE.MeshBasicMaterial({
-      color: "#050a07",
-      side: THREE.DoubleSide,
-    })
-  );
-
-  digitalFloor.rotation.x = -Math.PI / 2;
-  digitalFloor.position.set(0, -1, -34);
-  digitalWorld.add(digitalFloor);
-
-  // Tunnel grid
-  const gridMaterial = new THREE.LineBasicMaterial({
-    color: "#28563a",
-    transparent: true,
-    opacity: 0.32,
-  });
-
-  const brightGridMaterial = new THREE.LineBasicMaterial({
-    color: "#527d61",
-    transparent: true,
-    opacity: 0.5,
-  });
-
-  for (let i = 0; i <= 30; i++) {
-    const z = -9 - i * 1.5;
-
-    addLine(
-      digitalWorld,
-      [
-        new THREE.Vector3(-9, -0.95, z),
-        new THREE.Vector3(9, -0.95, z),
-      ],
-      i % 4 === 0 ? "#527d61" : "#28563a",
-      i % 4 === 0 ? 0.45 : 0.22
-    );
-  }
-
-  for (let i = 0; i <= 24; i++) {
-    const x = -9 + i * 0.75;
-
-    addLine(
-      digitalWorld,
-      [
-        new THREE.Vector3(x, -0.95, -9),
-        new THREE.Vector3(x, -0.95, -55),
-      ],
-      i % 4 === 0 ? "#527d61" : "#28563a",
-      i % 4 === 0 ? 0.4 : 0.18
-    );
-  }
-
-  // Floating code panels - kept inside the tunnel
-  const terminalPanels: THREE.Mesh[] = [];
-
-  const panelTexts = [
-    "NETWORK / SECURE",
-    "AUTHENTICATION OK",
-    "DATA STREAM ACTIVE",
-    "SYSTEM ACCESS GRANTED",
-    "ENCRYPTION ENABLED",
-    "PROCESS RUNNING",
-  ];
-
-  panelTexts.forEach((message, index) => {
-    const canvas = document.createElement("canvas");
-    canvas.width = 640;
-    canvas.height = 240;
-
-    const context = canvas.getContext("2d");
-    if (!context) return;
-
-    context.fillStyle = "rgba(5, 12, 8, 0.96)";
-    context.fillRect(0, 0, 640, 240);
-
-    context.strokeStyle = "#355d40";
-    context.lineWidth = 3;
-    context.strokeRect(3, 3, 634, 234);
-
-    context.fillStyle = "#91b49a";
-    context.font = "bold 27px monospace";
-    context.fillText("SYSTEM / TERMINAL", 25, 52);
-
-    context.fillStyle = "#659b75";
-    context.font = "23px monospace";
-    context.fillText("> " + message, 25, 110);
-
-    context.fillStyle = "#527d61";
-    context.font = "19px monospace";
-    context.fillText("STATUS: ACTIVE  //  0" + (index + 1), 25, 165);
-
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.colorSpace = THREE.SRGBColorSpace;
-
-    const panel = new THREE.Mesh(
-      new THREE.PlaneGeometry(2.6, 0.98),
-      new THREE.MeshBasicMaterial({
-        map: texture,
-        transparent: true,
-        toneMapped: false,
-      })
-    );
-
-    const side = index % 2 === 0 ? -1 : 1;
-
-    panel.position.set(
-      side * 3.4,
-      1.5 + (index % 3) * 0.7,
-      -15 - index * 5
-    );
-
-    panel.rotation.y = side * -0.18;
-
-    digitalWorld.add(panel);
-    terminalPanels.push(panel);
-  });
-
-  // Data nodes
-  const dataNodes: THREE.Mesh[] = [];
-
-  const nodeGeometry = new THREE.SphereGeometry(0.025, 8, 8);
-  const nodeMaterial = new THREE.MeshBasicMaterial({
-    color: "#6c9b78",
-    toneMapped: false,
-  });
-
-  for (let i = 0; i < 85; i++) {
-    const node = new THREE.Mesh(nodeGeometry, nodeMaterial);
-
-    node.position.set(
-      (Math.random() - 0.5) * 12,
-      Math.random() * 5,
-      -12 - Math.random() * 42
-    );
-
-    digitalWorld.add(node);
-    dataNodes.push(node);
-  }
-
-  // Distant focal point
-  const portalCore = new THREE.Mesh(
-    new THREE.IcosahedronGeometry(1.1, 2),
-    new THREE.MeshBasicMaterial({
-      color: "#315d40",
-      wireframe: true,
-      toneMapped: false,
-    })
-  );
-
-  portalCore.position.set(0, 2.2, -52);
-  digitalWorld.add(portalCore);
-
-  // =====================================
-  // LIGHTING
-  // =====================================
-
-  scene.add(new THREE.AmbientLight("#84918a", 0.22));
-
-  const roomLight = new THREE.PointLight("#557b65", 9, 13);
-  roomLight.position.set(0, 4.5, -7);
-  room.add(roomLight);
-
-  const screenLight = new THREE.PointLight("#4b9b69", 5, 6);
-  screenLight.position.set(0, 2.8, -5.5);
-  room.add(screenLight);
-
-  const hallwayLight = new THREE.PointLight("#87968d", 12, 15);
-  hallwayLight.position.set(-1, 4.5, 4);
-  room.add(hallwayLight);
-
-  const doorLight = new THREE.PointLight("#54785e", 8, 9);
-  doorLight.position.set(0, 2.5, 2.5);
-  room.add(doorLight);
-
-  const digitalLight = new THREE.PointLight("#41694d", 12, 35);
-  digitalLight.position.set(0, 3, -25);
-  digitalWorld.add(digitalLight);
-
-  // =====================================
-  // RESIZE
-  // =====================================
-
+  /** Cheap and idempotent: safe to call from resize, orientationchange and
+   *  ResizeObserver without ever rebuilding the scene. */
   function resize() {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
+    applyQuality();
+    const { w, h } = size();
+    if (w === lastW && h === lastH) return;
+    lastW = w;
+    lastH = h;
 
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    renderer.setSize(w, h, false);
+    canvas.style.width = "100%";
+    canvas.style.height = "100%";
+    const aspect = w / h;
+    roomCam.aspect = aspect;
+    roomCam.fov =
+      aspect >= 1.2
+        ? 42
+        : Math.min(72, deg(2 * Math.atan(Math.tan(rad(21)) * (1.2 / aspect))));
+    roomCam.updateProjectionMatrix();
+    needsFrame = true;
   }
 
-  // =====================================
-  // ANIMATION AND CLEANUP
-  // =====================================
-
-  function update() {
-    drawTerminal();
-
-    portalCore.rotation.x += 0.001;
-    portalCore.rotation.y += 0.002;
-
-    renderer.render(scene, camera);
+  function setReducedMotion(value: boolean) {
+    reducedMotion = value;
+    needsFrame = true;
   }
+
+  // ---------- Render ----------
+  let lastTerminal = -1;
+  let renderedOnce = false;
+  let lastKey = "";
+  let lastFrameAt = performance.now();
+  let frameEma = 16;
+  let slowFrames = 0;
+
+  function isDirect() {
+    return state.approach >= 0.999 && state.mix >= 0.999;
+  }
+
+  function watchPerformance() {
+    const now = performance.now();
+    const dt = now - lastFrameAt;
+    lastFrameAt = now;
+    if (dt > 250) return; // ignore tab-switch / scroll-jank gaps
+    frameEma = frameEma * 0.95 + dt * 0.05;
+    if (!profile.mobile || degraded) return;
+    slowFrames = frameEma > 30 ? slowFrames + 1 : Math.max(0, slowFrames - 2);
+    if (slowFrames > 150) {
+      degraded = true;
+      applyQuality();
+    }
+  }
+
+  function render(rawTime: number) {
+    const t = reducedMotion ? 0 : rawTime;
+    const { w, h } = size();
+    const pr = renderer.getPixelRatio();
+
+    if (reducedMotion) {
+      // Nothing animates on its own: only draw when scroll/size changed.
+      const key = [
+        state.door, state.walk, state.approach, state.mix,
+        state.depthPre, state.depthMain, w, h, pr,
+      ].join("|");
+      if (key === lastKey && !needsFrame) return;
+      lastKey = key;
+    } else {
+      watchPerformance();
+    }
+    needsFrame = false;
+
+    if (isDirect()) {
+      // The screen now fills the viewport: render the digital world on its own.
+      const depth = state.depthPre + state.depthMain;
+      digital.update(t);
+      digital.setViewportHeight(h * pr);
+      digCam.aspect = w / h;
+      digCam.fov = directFov(depth, digCam.aspect);
+      digCam.updateProjectionMatrix();
+      poseDigitalCamera(depth);
+      renderer.render(digital.scene, digCam);
+      renderedOnce = true;
+      return;
+    }
+
+    room.setDoor(state.door);
+    room.update(t);
+    screenMaterial.uniforms.uMix.value = state.mix;
+    screenMaterial.uniforms.uTime.value = t;
+
+    // The terminal is only visible once the door has started to open.
+    if (
+      (state.door > 0.02 || !renderedOnce) &&
+      t - lastTerminal > profile.terminalInterval
+    ) {
+      lastTerminal = t;
+      terminal.draw(t);
+    }
+
+    if (state.mix > 0.001) {
+      digital.update(t);
+      digital.setViewportHeight(rtHeight);
+      digCam.aspect = SCREEN_ASPECT;
+      digCam.fov = RT_FOV;
+      digCam.updateProjectionMatrix();
+      poseDigitalCamera(state.depthPre);
+      renderer.setRenderTarget(rt);
+      renderer.render(digital.scene, digCam);
+      renderer.setRenderTarget(null);
+    }
+
+    poseRoomCamera();
+    renderer.render(roomScene, roomCam);
+    renderedOnce = true;
+  }
+
+  resize();
+  render(0);
 
   function dispose() {
-    scene.traverse((object) => {
-      if (
-        object instanceof THREE.Mesh ||
-        object instanceof THREE.Line
-      ) {
-        object.geometry.dispose();
-
-        const materials = Array.isArray(object.material)
-          ? object.material
-          : [object.material];
-
-        materials.forEach((material) => {
-          Object.values(material).forEach((value) => {
-            if (value instanceof THREE.Texture) {
-              value.dispose();
-            }
-          });
-
-          material.dispose();
-        });
-      }
-    });
-
+    disposeObject(roomScene);
+    digital.dispose();
+    terminal.dispose();
+    screenMaterial.dispose();
+    rt.dispose();
+    envTarget.dispose();
     renderer.dispose();
-    renderer.domElement.remove();
+    renderer.forceContextLoss();
+    canvas.remove();
   }
 
-  renderer.render(scene, camera);
-
-  return {
-    scene,
-    camera,
-    renderer,
-    room,
-    doorPivot,
-    laptop,
-    developer,
-    digitalWorld,
-    terminalPanels,
-    dataNodes,
-    resize,
-    update,
-    dispose,
-  };
+  return { state, domElement: canvas, resize, render, setReducedMotion, dispose };
 }
 
+export type World = ReturnType<typeof createScene>;

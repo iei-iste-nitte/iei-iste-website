@@ -873,6 +873,112 @@ button, a {
   }
 }
 
+/* MOBILE NAVIGATION (hamburger only exists on narrow screens) */
+
+.mobile-nav {
+  display: none;
+}
+
+html {
+  overflow-x: clip;
+}
+
+@media (max-width: 600px) {
+  /* Keep the nav reachable while scrolling the long journey */
+  .navbar {
+    position: fixed;
+    gap: 10px;
+  }
+
+  .nav-cta {
+    min-height: 44px;
+    margin-left: auto;
+  }
+
+  .mobile-nav {
+    display: block;
+  }
+
+  .mobile-nav-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: rgba(255, 255, 255, 0.04);
+    color: #fff;
+    cursor: pointer;
+    touch-action: manipulation;
+  }
+
+  .mobile-nav-panel {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 8px 5% 16px;
+    background: rgba(5, 8, 7, 0.985);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .mobile-nav-panel[hidden] {
+    display: none;
+  }
+
+  .mobile-nav-panel a {
+    display: flex;
+    align-items: center;
+    min-height: 52px;
+    font-size: 16px;
+    color: #d6dbe8;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    touch-action: manipulation;
+  }
+
+  .mobile-nav-panel a:last-child {
+    border-bottom: 0;
+  }
+
+  /* "Scroll to explore" collided with the buttons: flow it after them */
+  .hero-bottom {
+    position: static;
+    margin-top: 32px;
+  }
+
+  .hero h1 {
+    word-break: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .community-glow {
+    max-width: 100vw;
+  }
+
+  .footer {
+    overflow-wrap: anywhere;
+  }
+}
+
+/* Short landscape phones: shrink the hero so copy and door both fit */
+@media (max-height: 480px) and (orientation: landscape) {
+  .hero {
+    min-height: 0;
+    padding-top: 110px;
+    padding-bottom: 60px;
+  }
+
+  .hero h1 {
+    font-size: clamp(40px, 9vh, 64px);
+    letter-spacing: -2px;
+  }
+}
+
 /* ACCESSIBILITY: REDUCE MOTION */
 
 @media (prefers-reduced-motion: reduce) {
@@ -1001,61 +1107,23 @@ main {
   }
 }
 
-/* BEYOND THE SCREEN */
-
-.beyond-screen-background {
-  position: fixed;
-  inset: 0;
-  width: 100%;
-  height: 100vh;
-  height: 100dvh;
-  z-index: 0;
-  overflow: hidden;
-  pointer-events: none;
-  background: #08090c;
-}
-
-.beyond-screen-background canvas {
-  display: block;
-  width: 100%;
-  height: 100%;
-}
-
-.site-content {
-  position: relative;
-  z-index: 1;
-}
-
-.hero,
-.about-section,
-.events-section,
-.community-section,
-.contact-section,
-.footer {
-  background-color: transparent !important;
-}
-/* Extra scroll space for the digital world transition */
-.beyond-scroll-runway {
-  position: relative;
-  width: 100%;
-  height: 220vh;
-  pointer-events: none;
-  background: transparent;
-}
-
 /* =====================================
-   FULLSCREEN 3D BACKGROUND
+   BEYOND THE SCREEN — cinematic 3D layer
 ===================================== */
 
 .beyond-screen-background {
   position: fixed;
-  inset: 0;
+  top: 0;
+  left: 0;
   width: 100%;
+  /* lvh (not dvh): the canvas keeps one size while the mobile address bar
+     slides in and out, so the camera framing never jumps. */
   height: 100vh;
+  height: 100lvh;
   z-index: 0;
   overflow: hidden;
   pointer-events: none;
-  background: #050706;
+  background: #030504;
 }
 
 .beyond-screen-background canvas {
@@ -1064,24 +1132,32 @@ main {
   height: 100%;
 }
 
+/* Soft vignette keeps the page copy readable over the 3D scene */
+.beyond-screen-background::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    linear-gradient(90deg, rgba(3, 5, 4, 0.4) 0%, rgba(3, 5, 4, 0.08) 55%, rgba(3, 5, 4, 0) 100%),
+    radial-gradient(ellipse at center, transparent 45%, rgba(3, 5, 4, 0.5) 100%);
+}
+
 .site-content {
   position: relative;
   z-index: 1;
 }
 
-/* Keep the website sections transparent */
 .site-content section {
   background: transparent;
 }
 
-/* =====================================
-   EXTENDED DIGITAL JOURNEY
-===================================== */
-
+/* Extra scroll after the footer: enter the laptop and travel through the
+   digital world. Drives the second ScrollTrigger timeline. */
 .beyond-scroll-runway {
   position: relative;
   width: 100%;
-  height: 400vh;
+  height: 900vh;
   pointer-events: none;
   background: transparent;
 }

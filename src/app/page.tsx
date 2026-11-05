@@ -1,4 +1,5 @@
 
+import MobileNav from "./components/MobileNav";
 import {
   ArrowDown,
   ArrowRight,
@@ -79,6 +80,8 @@ export default function Home() {
         <a href="#events" className="nav-cta">
           Explore events <ArrowUpRight size={15} />
         </a>
+
+        <MobileNav />
       </header>
 
       {/* HERO */}
@@ -284,16 +287,13 @@ export default function Home() {
           © 2026 IEI × ISTE NITTE. All rights reserved.
         </span>
       </footer>
+
+      {/* Extra scroll distance: the camera enters the laptop and travels through the digital world */}
       <section
-  id="beyond-scroll-runway"
-  className="beyond-scroll-runway"
-  aria-label="Enter the digital world"
-/>
+        id="beyond-scroll-runway"
+        className="beyond-scroll-runway"
+        aria-label="Enter the digital world"
+      />
     </main>
   );
 }
-<section
-  id="beyond-scroll-runway"
-  className="beyond-scroll-runway"
-  aria-label="Enter the digital environment"
-/>
