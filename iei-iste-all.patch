@@ -1,0 +1,4400 @@
+From ca193ce5b5ba7924ad38654d24222cd0795b31d5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 09:18:03 +0000
+Subject: [PATCH 1/3] Make cinematic scroll experience mobile-responsive and
+ optimised
+
+- Quality profile: mobile DPR cap 1.25, 45% particle/panel/wireframe density,
+  no shadow maps, smaller/cheaper portal render target, slower terminal redraw
+- Adaptive fallback to 1x DPR + lighter scene if a phone sustains <33fps
+- Portrait camera framing (back off at the door, close in on the laptop);
+  zero effect on landscape/desktop
+- Idempotent resize via ResizeObserver + orientationchange; canvas sized in
+  lvh so the address bar never changes it; no scene recreation
+- prefers-reduced-motion: unscrubbed, render-on-change, frozen ambient motion
+- Touch-friendly hamburger nav, fixed navbar, hero-bottom overflow fix on phones
+- Full listener/loop/resource cleanup on unmount
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GduWwzosU2paBti3qSezKP
+---
+ .../BeyondTheScreen/BeyondTheScreen.tsx       | 123 ++++++++++----
+ src/app/components/BeyondTheScreen/digital.ts |  18 ++
+ src/app/components/BeyondTheScreen/room.ts    |   8 +-
+ src/app/components/BeyondTheScreen/scene.ts   | 160 ++++++++++++++++--
+ src/app/components/MobileNav.tsx              |  65 +++++++
+ src/app/globals.css                           | 113 ++++++++++++-
+ src/app/page.tsx                              |   3 +
+ 7 files changed, 432 insertions(+), 58 deletions(-)
+ create mode 100644 src/app/components/MobileNav.tsx
+
+diff --git a/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx b/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
+index be17a76..0b0b22f 100644
+--- a/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
++++ b/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
+@@ -6,6 +6,8 @@ import { ScrollTrigger } from "gsap/ScrollTrigger";
+ import { createScene, DEPTH_MAIN_MAX, DEPTH_PRE_MAX } from "./scene";
+ 
+ gsap.registerPlugin(ScrollTrigger);
++// Mobile browsers resize the viewport as the address bar slides in/out; this
++// stops that from re-measuring (and so jumping) the scrubbed timelines.
+ ScrollTrigger.config({ ignoreMobileResize: true });
+ 
+ /**
+@@ -19,6 +21,10 @@ ScrollTrigger.config({ ignoreMobileResize: true });
+  *
+  * Each timeline writes to its own fields on a shared state object; the render
+  * loop reads that state, so nothing ever fights over the camera.
++ *
++ * Nothing here touches scrolling itself (no scroll locking, no
++ * normalizeScroll, canvas is pointer-events: none), so native touch scrolling
++ * is preserved.
+  */
+ export default function BeyondTheScreen() {
+   const containerRef = useRef<HTMLDivElement>(null);
+@@ -42,54 +48,92 @@ export default function BeyondTheScreen() {
+ 
+     const runway = document.getElementById("beyond-scroll-runway");
+     const { state } = world;
++    const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
++
++    // Timelines are rebuilt only when the motion preference flips; the scene
++    // itself is never recreated.
++    const buildTimelines = (reduce: boolean) =>
++      gsap.context(() => {
++        // `true` = tie directly to scroll with no easing lag.
++        const scrub: boolean | number = reduce ? true : 0.8;
+ 
+-    const ctx = gsap.context(() => {
+-      const scrub = window.matchMedia("(prefers-reduced-motion: reduce)").matches
+-        ? 0.2
+-        : 0.8;
+-
+-      // Phase 1-4: door, walk in, approach the laptop (website content scroll)
+-      const roomTl = gsap.timeline({
+-        defaults: { ease: "none" },
+-        scrollTrigger: {
+-          trigger: document.documentElement,
+-          start: "top top",
+-          endTrigger: runway ?? document.body,
+-          end: runway ? "top bottom" : "bottom bottom",
+-          scrub,
+-          invalidateOnRefresh: true,
+-        },
+-      });
+-      roomTl
+-        .fromTo(state, { door: 0 }, { door: 1, duration: 1.8, ease: "power2.inOut", immediateRender: false }, 0)
+-        .fromTo(state, { walk: 0 }, { walk: 1, duration: 4.2, ease: "power1.inOut", immediateRender: false }, 1.6);
+-
+-      // Phase 5-6: enter the screen and travel through the digital world
+-      if (runway) {
+-        const digitalTl = gsap.timeline({
++        // Phase 1-4: door, walk in, approach the laptop (website content scroll)
++        const roomTl = gsap.timeline({
+           defaults: { ease: "none" },
+           scrollTrigger: {
+-            trigger: runway,
+-            start: "top bottom",
+-            end: "bottom bottom",
++            trigger: document.documentElement,
++            start: "top top",
++            endTrigger: runway ?? document.body,
++            end: runway ? "top bottom" : "bottom bottom",
+             scrub,
+             invalidateOnRefresh: true,
+           },
+         });
+-        digitalTl
+-          .fromTo(state, { approach: 0 }, { approach: 1, duration: 1.6, ease: "power2.inOut", immediateRender: false }, 0)
+-          .fromTo(state, { mix: 0 }, { mix: 1, duration: 1.0, ease: "power1.inOut", immediateRender: false }, 0.9)
+-          .fromTo(state, { depthPre: 0 }, { depthPre: DEPTH_PRE_MAX, duration: 1.9, immediateRender: false }, 0)
+-          .fromTo(state, { depthMain: 0 }, { depthMain: DEPTH_MAIN_MAX, duration: 8.1, ease: "power1.inOut", immediateRender: false }, 1.9);
+-      }
+-    }, container);
++        roomTl
++          .fromTo(state, { door: 0 }, { door: 1, duration: 1.8, ease: "power2.inOut", immediateRender: false }, 0)
++          .fromTo(state, { walk: 0 }, { walk: 1, duration: 4.2, ease: "power1.inOut", immediateRender: false }, 1.6);
++
++        // Phase 5-6: enter the screen and travel through the digital world
++        if (runway) {
++          const digitalTl = gsap.timeline({
++            defaults: { ease: "none" },
++            scrollTrigger: {
++              trigger: runway,
++              start: "top bottom",
++              end: "bottom bottom",
++              scrub,
++              invalidateOnRefresh: true,
++            },
++          });
++          digitalTl
++            .fromTo(state, { approach: 0 }, { approach: 1, duration: 1.6, ease: "power2.inOut", immediateRender: false }, 0)
++            .fromTo(state, { mix: 0 }, { mix: 1, duration: 1.0, ease: "power1.inOut", immediateRender: false }, 0.9)
++            .fromTo(state, { depthPre: 0 }, { depthPre: DEPTH_PRE_MAX, duration: 1.9, immediateRender: false }, 0)
++            .fromTo(state, { depthMain: 0 }, { depthMain: DEPTH_MAIN_MAX, duration: 8.1, ease: "power1.inOut", immediateRender: false }, 1.9);
++        }
++      }, container);
++
++    world.setReducedMotion(motionQuery.matches);
++    let ctx = buildTimelines(motionQuery.matches);
++
++    const onMotionChange = (event: MediaQueryListEvent) => {
++      world.setReducedMotion(event.matches);
++      ctx.revert();
++      ctx = buildTimelines(event.matches);
++      ScrollTrigger.refresh();
++    };
++    motionQuery.addEventListener("change", onMotionChange);
+ 
+     // Single render loop, shared with GSAP's ticker (pauses with the tab).
+     const tick = (time: number) => world.render(time);
+     gsap.ticker.add(tick);
+ 
+-    const onResize = () => world.resize();
+-    window.addEventListener("resize", onResize);
++    // Resize handling: coalesced into one call per frame, idempotent, and it
++    // never rebuilds the scene (see scene.resize / applyQuality).
++    let resizeRaf = 0;
++    const scheduleResize = () => {
++      cancelAnimationFrame(resizeRaf);
++      resizeRaf = requestAnimationFrame(() => world.resize());
++    };
++    window.addEventListener("resize", scheduleResize);
++
++    // iOS/Android report the new size a beat after `orientationchange`.
++    let orientationTimer = 0;
++    const onOrientation = () => {
++      scheduleResize();
++      window.clearTimeout(orientationTimer);
++      orientationTimer = window.setTimeout(() => {
++        world.resize();
++        ScrollTrigger.refresh();
++      }, 300);
++    };
++    window.addEventListener("orientationchange", onOrientation);
++
++    const observer =
++      typeof ResizeObserver !== "undefined"
++        ? new ResizeObserver(scheduleResize)
++        : null;
++    observer?.observe(container);
+ 
+     const refresh = () => ScrollTrigger.refresh();
+     const raf = requestAnimationFrame(refresh);
+@@ -100,8 +144,13 @@ export default function BeyondTheScreen() {
+ 
+     return () => {
+       cancelAnimationFrame(raf);
++      cancelAnimationFrame(resizeRaf);
++      window.clearTimeout(orientationTimer);
+       window.removeEventListener("load", refresh);
+-      window.removeEventListener("resize", onResize);
++      window.removeEventListener("resize", scheduleResize);
++      window.removeEventListener("orientationchange", onOrientation);
++      motionQuery.removeEventListener("change", onMotionChange);
++      observer?.disconnect();
+       gsap.ticker.remove(tick);
+       ctx.revert();
+       world.dispose();
+diff --git a/src/app/components/BeyondTheScreen/digital.ts b/src/app/components/BeyondTheScreen/digital.ts
+index 2e0cc2a..d72948d 100644
+--- a/src/app/components/BeyondTheScreen/digital.ts
++++ b/src/app/components/BeyondTheScreen/digital.ts
+@@ -390,9 +390,11 @@ export function createDigitalWorld() {
+       toneMapped: false,
+     });
+   const glyphMats = [makeGlyphMat(glyphA), makeGlyphMat(glyphB)];
++  const glyphPlanes: THREE.Mesh[] = [];
+   for (let i = 0; i < 12; i++) {
+     [-1, 1].forEach((side, s) => {
+       const m = new THREE.Mesh(glyphGeo, glyphMats[(i + s) % 2]);
++      glyphPlanes.push(m);
+       m.position.set(side * 5.93, 0.6, -14 - i * 29 - (s ? 14 : 0));
+       m.rotation.y = side < 0 ? Math.PI / 2 : -Math.PI / 2;
+       scene.add(m);
+@@ -487,6 +489,7 @@ export function createDigitalWorld() {
+   );
+ 
+   const PULSES = 56;
++  const PARTICLE_TOTAL = PARTICLES;
+   const pulseState = Array.from({ length: PULSES }, () => ({
+     edge: Math.floor(rand() * edges.length),
+     t: rand(),
+@@ -673,9 +676,24 @@ export function createDigitalWorld() {
+     pulseGeo.attributes.position.needsUpdate = true;
+   }
+ 
++  /**
++   * Adjusts density without rebuilding anything. density 1 = full desktop
++   * scene (the default, unchanged); lower values trim particles, floating
++   * panels, wireframes, code walls and network pulses.
++   */
++  function setQuality(density: number) {
++    const reduced = density < 1;
++    pGeo.setDrawRange(0, Math.floor(PARTICLE_TOTAL * density));
++    pulseGeo.setDrawRange(0, Math.floor(PULSES * Math.max(density, 0.4)));
++    huds.forEach((h, i) => (h.group.visible = !reduced || i % 4 < 2));
++    shapes.forEach(({ mesh }, i) => (mesh.visible = !reduced || i % 2 === 0));
++    glyphPlanes.forEach((m, i) => (m.visible = !reduced || i % 2 === 0));
++  }
++
+   return {
+     scene,
+     update,
++    setQuality,
+     /** Point-size scale; pass the render-target height in pixels. */
+     setViewportHeight(h: number) {
+       particleMat.uniforms.uScale.value = h * 0.55;
+diff --git a/src/app/components/BeyondTheScreen/room.ts b/src/app/components/BeyondTheScreen/room.ts
+index 7f03f6d..000d1be 100644
+--- a/src/app/components/BeyondTheScreen/room.ts
++++ b/src/app/components/BeyondTheScreen/room.ts
+@@ -554,6 +554,12 @@ export function createRoom(screenMaterial: THREE.Material) {
+     }
+   }
+ 
++  /** Shadow maps are the single most expensive part of the room on phones. */
++  function setQuality(shadows: boolean) {
++    hallSpot.castShadow = shadows;
++    keySpot.castShadow = shadows;
++  }
++
+   // Receive shadows on everything static
+   group.traverse((o) => {
+     const mesh = o as THREE.Mesh;
+@@ -564,5 +570,5 @@ export function createRoom(screenMaterial: THREE.Material) {
+ 
+   setDoor(0);
+ 
+-  return { group, screen, setDoor, update };
++  return { group, screen, setDoor, update, setQuality };
+ }
+diff --git a/src/app/components/BeyondTheScreen/scene.ts b/src/app/components/BeyondTheScreen/scene.ts
+index 1e2aea2..27ff322 100644
+--- a/src/app/components/BeyondTheScreen/scene.ts
++++ b/src/app/components/BeyondTheScreen/scene.ts
+@@ -21,6 +21,33 @@ export const DEPTH_PRE_MAX = 10;
+ export const DEPTH_MAIN_MAX = DEPTH_MAX - DEPTH_PRE_MAX;
+ 
+ const RT_FOV = 58;
++
++/** Rendering budget. Desktop values are the original, unchanged settings. */
++interface QualityProfile {
++  mobile: boolean;
++  maxPixelRatio: number;
++  density: number; // particles / panels / wireframes (1 = full)
++  shadows: boolean;
++  rtWidth: number; // portal render-target width
++  rtSamples: number; // portal MSAA samples
++  terminalInterval: number; // seconds between terminal redraws
++}
++
++const DESKTOP: QualityProfile = {
++  mobile: false, maxPixelRatio: 1.5, density: 1, shadows: true,
++  rtWidth: 1536, rtSamples: 4, terminalInterval: 0.07,
++};
++const MOBILE: QualityProfile = {
++  mobile: true, maxPixelRatio: 1.25, density: 0.45, shadows: false,
++  rtWidth: 1024, rtSamples: 2, terminalInterval: 0.1,
++};
++
++function detectProfile(): QualityProfile {
++  const narrow = window.matchMedia("(max-width: 820px)").matches;
++  const coarse = window.matchMedia("(pointer: coarse)").matches;
++  const smallSide = Math.min(window.innerWidth, window.innerHeight) <= 820;
++  return narrow || (coarse && smallSide) ? MOBILE : DESKTOP;
++}
+ const rad = THREE.MathUtils.degToRad;
+ const deg = THREE.MathUtils.radToDeg;
+ 
+@@ -99,12 +126,15 @@ export function createScene(container: HTMLElement) {
+   const floatOk =
+     renderer.extensions.has("EXT_color_buffer_float") ||
+     renderer.extensions.has("EXT_color_buffer_half_float");
+-  const RT_W = 1536;
+-  const RT_H = Math.round(RT_W / SCREEN_ASPECT);
+-  const rt = new THREE.WebGLRenderTarget(RT_W, RT_H, {
+-    samples: 4,
+-    type: floatOk ? THREE.HalfFloatType : THREE.UnsignedByteType,
+-  });
++  let profile = detectProfile();
++  const rt = new THREE.WebGLRenderTarget(
++    profile.rtWidth,
++    Math.round(profile.rtWidth / SCREEN_ASPECT),
++    {
++      samples: profile.rtSamples,
++      type: floatOk ? THREE.HalfFloatType : THREE.UnsignedByteType,
++    }
++  );
+ 
+   // ---------- Content ----------
+   const terminal = createTerminal();
+@@ -209,6 +239,15 @@ export function createScene(container: HTMLElement) {
+     walkCurve.getPoint(w, camPos);
+     lookCurve.getPoint(w, lookAt);
+ 
++    // Portrait phones: the horizontal field of view is narrow, so stand a
++    // little further back at the door and walk closer to the laptop. This is
++    // zero for any landscape aspect, leaving desktop framing untouched.
++    const portrait = THREE.MathUtils.clamp((1 - roomCam.aspect) / 0.4, 0, 1);
++    if (portrait > 0) {
++      camPos.z += 0.8 * portrait * (1 - smoothstep(0, 0.3, w));
++      camPos.lerp(screenCenter, 0.16 * portrait * smoothstep(0.55, 1, w));
++    }
++
+     if (state.approach > 0) {
+       const e = THREE.MathUtils.clamp(state.approach, 0, 1);
+       const t = Math.tan(rad(roomCam.fov / 2));
+@@ -248,10 +287,54 @@ export function createScene(container: HTMLElement) {
+     return THREE.MathUtils.lerp(matched, target, smoothstep(DEPTH_PRE_MAX, 70, depth));
+   }
+ 
+-  // ---------- Resize ----------
++  // ---------- Quality, resize ----------
++  // Adaptive fallback: if a phone sustains < ~33 fps we drop to 1x pixel
++  // ratio and a lighter scene. Never applies to the desktop profile.
++  let degraded = false;
++  let reducedMotion = false;
++  let needsFrame = true;
++  let qualityKey = "";
++  let rtHeight = Math.round(profile.rtWidth / SCREEN_ASPECT);
++
++  function applyQuality() {
++    profile = detectProfile();
++    const useLite = profile.mobile && degraded;
++    const key = `${profile.mobile}|${useLite}|${window.devicePixelRatio}`;
++    if (key === qualityKey) return;
++    qualityKey = key;
++
++    const pr = useLite
++      ? 1
++      : Math.min(window.devicePixelRatio || 1, profile.maxPixelRatio);
++    if (renderer.getPixelRatio() !== pr) renderer.setPixelRatio(pr);
++
++    digital.setQuality(profile.density * (useLite ? 0.7 : 1));
++    room.setQuality(profile.shadows);
++
++    const rtW = useLite ? 768 : profile.rtWidth;
++    if (rt.width !== rtW) {
++      rtHeight = Math.round(rtW / SCREEN_ASPECT);
++      rt.setSize(rtW, rtHeight);
++    }
++    if (rt.samples !== profile.rtSamples) {
++      rt.samples = profile.rtSamples;
++      rt.dispose(); // re-allocated lazily with the new sample count
++    }
++    needsFrame = true;
++  }
++
++  let lastW = 0;
++  let lastH = 0;
++
++  /** Cheap and idempotent: safe to call from resize, orientationchange and
++   *  ResizeObserver without ever rebuilding the scene. */
+   function resize() {
++    applyQuality();
+     const { w, h } = size();
+-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
++    if (w === lastW && h === lastH) return;
++    lastW = w;
++    lastH = h;
++
+     renderer.setSize(w, h, false);
+     canvas.style.width = "100%";
+     canvas.style.height = "100%";
+@@ -262,24 +345,62 @@ export function createScene(container: HTMLElement) {
+         ? 42
+         : Math.min(72, deg(2 * Math.atan(Math.tan(rad(21)) * (1.2 / aspect))));
+     roomCam.updateProjectionMatrix();
++    needsFrame = true;
++  }
++
++  function setReducedMotion(value: boolean) {
++    reducedMotion = value;
++    needsFrame = true;
+   }
+ 
+   // ---------- Render ----------
+   let lastTerminal = -1;
+   let renderedOnce = false;
++  let lastKey = "";
++  let lastFrameAt = performance.now();
++  let frameEma = 16;
++  let slowFrames = 0;
+ 
+   function isDirect() {
+     return state.approach >= 0.999 && state.mix >= 0.999;
+   }
+ 
+-  function render(time: number) {
++  function watchPerformance() {
++    const now = performance.now();
++    const dt = now - lastFrameAt;
++    lastFrameAt = now;
++    if (dt > 250) return; // ignore tab-switch / scroll-jank gaps
++    frameEma = frameEma * 0.95 + dt * 0.05;
++    if (!profile.mobile || degraded) return;
++    slowFrames = frameEma > 30 ? slowFrames + 1 : Math.max(0, slowFrames - 2);
++    if (slowFrames > 150) {
++      degraded = true;
++      applyQuality();
++    }
++  }
++
++  function render(rawTime: number) {
++    const t = reducedMotion ? 0 : rawTime;
+     const { w, h } = size();
+     const pr = renderer.getPixelRatio();
+ 
++    if (reducedMotion) {
++      // Nothing animates on its own: only draw when scroll/size changed.
++      const key = [
++        state.door, state.walk, state.approach, state.mix,
++        state.depthPre, state.depthMain, w, h, pr,
++      ].join("|");
++      if (key === lastKey && !needsFrame) return;
++      lastKey = key;
++    } else {
++      watchPerformance();
++    }
++    needsFrame = false;
++
+     if (isDirect()) {
+       // The screen now fills the viewport: render the digital world on its own.
+       const depth = state.depthPre + state.depthMain;
+-      digital.update(time);
++      digital.update(t);
+       digital.setViewportHeight(h * pr);
+       digCam.aspect = w / h;
+       digCam.fov = directFov(depth, digCam.aspect);
+@@ -291,19 +412,22 @@ export function createScene(container: HTMLElement) {
+     }
+ 
+     room.setDoor(state.door);
+-    room.update(time);
++    room.update(t);
+     screenMaterial.uniforms.uMix.value = state.mix;
+-    screenMaterial.uniforms.uTime.value = time;
++    screenMaterial.uniforms.uTime.value = t;
+ 
+     // The terminal is only visible once the door has started to open.
+-    if ((state.door > 0.02 || !renderedOnce) && time - lastTerminal > 0.07) {
+-      lastTerminal = time;
+-      terminal.draw(time);
++    if (
++      (state.door > 0.02 || !renderedOnce) &&
++      t - lastTerminal > profile.terminalInterval
++    ) {
++      lastTerminal = t;
++      terminal.draw(t);
+     }
+ 
+     if (state.mix > 0.001) {
+-      digital.update(time);
+-      digital.setViewportHeight(RT_H);
++      digital.update(t);
++      digital.setViewportHeight(rtHeight);
+       digCam.aspect = SCREEN_ASPECT;
+       digCam.fov = RT_FOV;
+       digCam.updateProjectionMatrix();
+@@ -333,7 +457,7 @@ export function createScene(container: HTMLElement) {
+     canvas.remove();
+   }
+ 
+-  return { state, domElement: canvas, resize, render, dispose };
++  return { state, domElement: canvas, resize, render, setReducedMotion, dispose };
+ }
+ 
+ export type World = ReturnType<typeof createScene>;
+diff --git a/src/app/components/MobileNav.tsx b/src/app/components/MobileNav.tsx
+new file mode 100644
+index 0000000..258546f
+--- /dev/null
++++ b/src/app/components/MobileNav.tsx
+@@ -0,0 +1,65 @@
++"use client";
++
++import { useEffect, useId, useState } from "react";
++import { Menu, X } from "lucide-react";
++
++const links = [
++  { href: "#home", label: "Home" },
++  { href: "#about", label: "About" },
++  { href: "#events", label: "Events" },
++  { href: "#team", label: "Our Team" },
++  { href: "#contact", label: "Contact" },
++];
++
++/**
++ * Touch-friendly menu for narrow screens. The desktop `.nav-links` row is
++ * untouched; this button/panel is only displayed at <= 600px (see globals.css).
++ */
++export default function MobileNav() {
++  const [open, setOpen] = useState(false);
++  const panelId = useId();
++
++  useEffect(() => {
++    if (!open) return;
++    const onKey = (event: KeyboardEvent) => {
++      if (event.key === "Escape") setOpen(false);
++    };
++    const onResize = () => {
++      if (window.innerWidth > 600) setOpen(false);
++    };
++    window.addEventListener("keydown", onKey);
++    window.addEventListener("resize", onResize);
++    return () => {
++      window.removeEventListener("keydown", onKey);
++      window.removeEventListener("resize", onResize);
++    };
++  }, [open]);
++
++  return (
++    <div className="mobile-nav">
++      <button
++        type="button"
++        className="mobile-nav-toggle"
++        aria-expanded={open}
++        aria-controls={panelId}
++        aria-label={open ? "Close menu" : "Open menu"}
++        onClick={() => setOpen((v) => !v)}
++      >
++        {open ? <X size={22} /> : <Menu size={22} />}
++      </button>
++
++      <nav
++        id={panelId}
++        className={`mobile-nav-panel${open ? " is-open" : ""}`}
++        aria-label="Primary"
++        hidden={!open}
++      >
++        {links.map((link) => (
++          <a key={link.href} href={link.href} onClick={() => setOpen(false)}>
++            {link.label}
++          </a>
++        ))}
++      </nav>
++    </div>
++  );
++}
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 3275646..0055080 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -873,6 +873,112 @@ button, a {
+   }
+ }
+ 
++/* MOBILE NAVIGATION (hamburger only exists on narrow screens) */
++
++.mobile-nav {
++  display: none;
++}
++
++html {
++  overflow-x: clip;
++}
++
++@media (max-width: 600px) {
++  /* Keep the nav reachable while scrolling the long journey */
++  .navbar {
++    position: fixed;
++    gap: 10px;
++  }
++
++  .nav-cta {
++    min-height: 44px;
++    margin-left: auto;
++  }
++
++  .mobile-nav {
++    display: block;
++  }
++
++  .mobile-nav-toggle {
++    display: inline-flex;
++    align-items: center;
++    justify-content: center;
++    width: 44px;
++    height: 44px;
++    border-radius: 10px;
++    border: 1px solid var(--border);
++    background: rgba(255, 255, 255, 0.04);
++    color: #fff;
++    cursor: pointer;
++    touch-action: manipulation;
++  }
++
++  .mobile-nav-panel {
++    position: absolute;
++    top: 100%;
++    left: 0;
++    right: 0;
++    display: flex;
++    flex-direction: column;
++    padding: 8px 5% 16px;
++    background: rgba(5, 8, 7, 0.985);
++    backdrop-filter: blur(18px);
++    -webkit-backdrop-filter: blur(18px);
++    border-bottom: 1px solid var(--border);
++  }
++
++  .mobile-nav-panel[hidden] {
++    display: none;
++  }
++
++  .mobile-nav-panel a {
++    display: flex;
++    align-items: center;
++    min-height: 52px;
++    font-size: 16px;
++    color: #d6dbe8;
++    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
++    touch-action: manipulation;
++  }
++
++  .mobile-nav-panel a:last-child {
++    border-bottom: 0;
++  }
++
++  /* "Scroll to explore" collided with the buttons: flow it after them */
++  .hero-bottom {
++    position: static;
++    margin-top: 32px;
++  }
++
++  .hero h1 {
++    word-break: normal;
++    overflow-wrap: anywhere;
++  }
++
++  .community-glow {
++    max-width: 100vw;
++  }
++
++  .footer {
++    overflow-wrap: anywhere;
++  }
++}
++
++/* Short landscape phones: shrink the hero so copy and door both fit */
++@media (max-height: 480px) and (orientation: landscape) {
++  .hero {
++    min-height: 0;
++    padding-top: 110px;
++    padding-bottom: 60px;
++  }
++
++  .hero h1 {
++    font-size: clamp(40px, 9vh, 64px);
++    letter-spacing: -2px;
++  }
++}
++
+ /* ACCESSIBILITY: REDUCE MOTION */
+ 
+ @media (prefers-reduced-motion: reduce) {
+@@ -1007,10 +1113,13 @@ main {
+ 
+ .beyond-screen-background {
+   position: fixed;
+-  inset: 0;
++  top: 0;
++  left: 0;
+   width: 100%;
++  /* lvh (not dvh): the canvas keeps one size while the mobile address bar
++     slides in and out, so the camera framing never jumps. */
+   height: 100vh;
+-  height: 100dvh;
++  height: 100lvh;
+   z-index: 0;
+   overflow: hidden;
+   pointer-events: none;
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index e4f1ba1..3adb8ec 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -1,4 +1,5 @@
+ 
++import MobileNav from "./components/MobileNav";
+ import {
+   ArrowDown,
+   ArrowRight,
+@@ -79,6 +80,8 @@ export default function Home() {
+         <a href="#events" className="nav-cta">
+           Explore events <ArrowUpRight size={15} />
+         </a>
++
++        <MobileNav />
+       </header>
+ 
+       {/* HERO */}
+-- 
+2.43.0
+
+
+From 783de4b1c3686aa4922e010634d5993f80d757c7 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 02:42:15 +0000
+Subject: [PATCH 2/3] Redesign: cinematic editorial identity,
+ journey-as-opening, new sections
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GduWwzosU2paBti3qSezKP
+---
+ package-lock.json                             |  154 +--
+ package.json                                  |    4 +
+ public/images/README.md                       |    5 +
+ .../BeyondTheScreen/BeyondTheScreen.tsx       |  105 +-
+ src/app/components/BeyondTheScreen/scene.ts   |    9 +-
+ src/app/components/MobileNav.tsx              |   65 -
+ src/app/components/Opening.tsx                |   51 +
+ src/app/components/SiteEffects.tsx            |   33 +
+ src/app/components/SiteHeader.tsx             |  100 ++
+ src/app/components/sections/About.tsx         |   62 +
+ src/app/components/sections/Contact.tsx       |   34 +
+ src/app/components/sections/Events.tsx        |   77 ++
+ src/app/components/sections/Footer.tsx        |   41 +
+ src/app/components/sections/Gallery.tsx       |   24 +
+ src/app/components/sections/GalleryViewer.tsx |  121 ++
+ src/app/components/sections/Team.tsx          |   40 +
+ src/app/components/sections/TeamDirectory.tsx |   71 +
+ src/app/components/ui/Frame.tsx               |   57 +
+ src/app/components/ui/SectionHead.tsx         |   16 +
+ src/app/data/site.ts                          |  126 ++
+ src/app/globals.css                           | 1168 +----------------
+ src/app/layout.tsx                            |   31 +-
+ src/app/page.tsx                              |  312 +----
+ src/app/styles/base.css                       |  114 ++
+ src/app/styles/gallery.css                    |   27 +
+ src/app/styles/nav.css                        |   28 +
+ src/app/styles/opening.css                    |   42 +
+ src/app/styles/sections.css                   |   96 ++
+ src/app/styles/tokens.css                     |   22 +
+ 29 files changed, 1362 insertions(+), 1673 deletions(-)
+ create mode 100644 public/images/README.md
+ delete mode 100644 src/app/components/MobileNav.tsx
+ create mode 100644 src/app/components/Opening.tsx
+ create mode 100644 src/app/components/SiteEffects.tsx
+ create mode 100644 src/app/components/SiteHeader.tsx
+ create mode 100644 src/app/components/sections/About.tsx
+ create mode 100644 src/app/components/sections/Contact.tsx
+ create mode 100644 src/app/components/sections/Events.tsx
+ create mode 100644 src/app/components/sections/Footer.tsx
+ create mode 100644 src/app/components/sections/Gallery.tsx
+ create mode 100644 src/app/components/sections/GalleryViewer.tsx
+ create mode 100644 src/app/components/sections/Team.tsx
+ create mode 100644 src/app/components/sections/TeamDirectory.tsx
+ create mode 100644 src/app/components/ui/Frame.tsx
+ create mode 100644 src/app/components/ui/SectionHead.tsx
+ create mode 100644 src/app/data/site.ts
+ create mode 100644 src/app/styles/base.css
+ create mode 100644 src/app/styles/gallery.css
+ create mode 100644 src/app/styles/nav.css
+ create mode 100644 src/app/styles/opening.css
+ create mode 100644 src/app/styles/sections.css
+ create mode 100644 src/app/styles/tokens.css
+
+diff --git a/package-lock.json b/package-lock.json
+index 077fd00..417c2e0 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -8,6 +8,10 @@
+       "name": "iei-iste-website",
+       "version": "0.1.0",
+       "dependencies": {
++        "@fontsource-variable/instrument-sans": "^5.3.0",
++        "@fontsource-variable/inter-tight": "^5.3.0",
++        "@fontsource-variable/jetbrains-mono": "^5.3.0",
++        "@fontsource/instrument-serif": "^5.3.0",
+         "@supabase/supabase-js": "^2.119.0",
+         "gsap": "^3.15.1",
+         "lucide-react": "^1.68.0",
+@@ -443,6 +447,42 @@
+         "node": "^18.18.0 || ^20.9.0 || >=21.1.0"
+       }
+     },
++    "node_modules/@fontsource-variable/instrument-sans": {
++      "version": "5.3.0",
++      "resolved": "https://registry.npmjs.org/@fontsource-variable/instrument-sans/-/instrument-sans-5.3.0.tgz",
++      "integrity": "sha512-u4gKbDBTNFGkg997tfQn3eHOhHuquWUFTRT/rwzuKtrxX5P2ekfs2x+LgBPP4P32+cC+vUwF1Cr+IdRoPQbrGw==",
++      "license": "OFL-1.1",
++      "funding": {
++        "url": "https://github.com/sponsors/ayuhito"
++      }
++    },
++    "node_modules/@fontsource-variable/inter-tight": {
++      "version": "5.3.0",
++      "resolved": "https://registry.npmjs.org/@fontsource-variable/inter-tight/-/inter-tight-5.3.0.tgz",
++      "integrity": "sha512-ZhZZ29sNZ15P1K+cUt13GeBRYON0akgmNiftshUeDLos7X7zGcRgPzt434879Xhq1QbwlW3M/apBMk7jWabwvA==",
++      "license": "OFL-1.1",
++      "funding": {
++        "url": "https://github.com/sponsors/ayuhito"
++      }
++    },
++    "node_modules/@fontsource-variable/jetbrains-mono": {
++      "version": "5.3.0",
++      "resolved": "https://registry.npmjs.org/@fontsource-variable/jetbrains-mono/-/jetbrains-mono-5.3.0.tgz",
++      "integrity": "sha512-F32xpS2NsGYoQi2ADSkKTgpJj7ozajsGgDJ8woTnqjmIB+dxDIqImjl4pXZVEExu8UFZ2ndhmX18EBS/hdz3Lw==",
++      "license": "OFL-1.1",
++      "funding": {
++        "url": "https://github.com/sponsors/ayuhito"
++      }
++    },
++    "node_modules/@fontsource/instrument-serif": {
++      "version": "5.3.0",
++      "resolved": "https://registry.npmjs.org/@fontsource/instrument-serif/-/instrument-serif-5.3.0.tgz",
++      "integrity": "sha512-mDiaIg0u67sYV59fie92Wz4sM8UiVlbL7fLxnFPCKkX15DMASEnQTREbaP5S5/3DCcsoAOcQ0sV9E4AeY4QqYQ==",
++      "license": "OFL-1.1",
++      "funding": {
++        "url": "https://github.com/sponsors/ayuhito"
++      }
++    },
+     "node_modules/@humanfs/core": {
+       "version": "0.19.2",
+       "resolved": "https://registry.npmjs.org/@humanfs/core/-/core-0.19.2.tgz",
+@@ -621,9 +661,6 @@
+       "cpu": [
+         "arm"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -640,9 +677,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -659,9 +693,6 @@
+       "cpu": [
+         "ppc64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -678,9 +709,6 @@
+       "cpu": [
+         "riscv64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -697,9 +725,6 @@
+       "cpu": [
+         "s390x"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -716,9 +741,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -735,9 +757,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -754,9 +773,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "LGPL-3.0-or-later",
+       "optional": true,
+       "os": [
+@@ -773,9 +789,6 @@
+       "cpu": [
+         "arm"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -798,9 +811,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -823,9 +833,6 @@
+       "cpu": [
+         "ppc64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -848,9 +855,6 @@
+       "cpu": [
+         "riscv64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -873,9 +877,6 @@
+       "cpu": [
+         "s390x"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -898,9 +899,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -923,9 +921,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -948,9 +943,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "Apache-2.0",
+       "optional": true,
+       "os": [
+@@ -1196,9 +1188,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1215,9 +1204,6 @@
+       "cpu": [
+         "arm64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1234,9 +1220,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1253,9 +1236,6 @@
+       "cpu": [
+         "x64"
+       ],
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1616,9 +1596,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1636,9 +1613,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1656,9 +1630,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -1676,9 +1647,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2319,9 +2287,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2336,9 +2301,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2353,9 +2315,6 @@
+         "loong64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2370,9 +2329,6 @@
+         "loong64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2387,9 +2343,6 @@
+         "ppc64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2404,9 +2357,6 @@
+         "riscv64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2421,9 +2371,6 @@
+         "riscv64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2438,9 +2385,6 @@
+         "s390x"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2455,9 +2399,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -2472,9 +2413,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MIT",
+       "optional": true,
+       "os": [
+@@ -5179,9 +5117,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -5203,9 +5138,6 @@
+         "arm64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -5227,9 +5159,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "glibc"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+@@ -5251,9 +5180,6 @@
+         "x64"
+       ],
+       "dev": true,
+-      "libc": [
+-        "musl"
+-      ],
+       "license": "MPL-2.0",
+       "optional": true,
+       "os": [
+diff --git a/package.json b/package.json
+index 894d26b..91e03f7 100644
+--- a/package.json
++++ b/package.json
+@@ -9,6 +9,10 @@
+     "lint": "eslint"
+   },
+   "dependencies": {
++    "@fontsource-variable/instrument-sans": "^5.3.0",
++    "@fontsource-variable/inter-tight": "^5.3.0",
++    "@fontsource-variable/jetbrains-mono": "^5.3.0",
++    "@fontsource/instrument-serif": "^5.3.0",
+     "@supabase/supabase-js": "^2.119.0",
+     "gsap": "^3.15.1",
+     "lucide-react": "^1.68.0",
+diff --git a/public/images/README.md b/public/images/README.md
+new file mode 100644
+index 0000000..df32322
+--- /dev/null
++++ b/public/images/README.md
+@@ -0,0 +1,5 @@
++# Photography drop-in
++
++Put photos in `events/`, `team/`, `gallery/` and set the `image` field of the matching
++entry in `src/app/data/site.ts` (e.g. `image: "/images/team/chair-iei.jpg"`).
++Team portraits work best at 4:5. Add a `name` and `bio` for each member at the same time.
+diff --git a/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx b/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
+index 0b0b22f..93305ef 100644
+--- a/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
++++ b/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
+@@ -11,23 +11,30 @@ gsap.registerPlugin(ScrollTrigger);
+ ScrollTrigger.config({ ignoreMobileResize: true });
+ 
+ /**
+- * Fixed full-screen WebGL layer driven by two ScrollTriggers:
++ * Fixed full-screen WebGL layer that IS the opening of the site. Two
++ * ScrollTriggers drive it:
+  *
+- *  1. ROOM   - top of page -> start of the runway (the website sections).
+- *              Door swings open, camera walks in towards the laptop.
+- *  2. DIGITAL - the runway (extra scroll after the footer).
+- *              Camera docks on the screen, the terminal dissolves into the
+- *              digital world, then the camera travels deep into it.
++ *  1. #journey-room    - door swings open, camera walks in to the laptop.
++ *  2. #journey-digital - camera docks on the screen, the terminal dissolves
++ *                        into the digital world, then travels deep into it.
+  *
+- * Each timeline writes to its own fields on a shared state object; the render
+- * loop reads that state, so nothing ever fights over the camera.
++ * The website sections slide over the final frame like a curtain; once they
++ * fully cover the canvas rendering is paused. A small HUD (scene / timecode /
++ * depth / skip) is updated imperatively from scroll progress.
+  *
+- * Nothing here touches scrolling itself (no scroll locking, no
+- * normalizeScroll, canvas is pointer-events: none), so native touch scrolling
+- * is preserved.
++ * Nothing here touches scrolling itself, so native touch scrolling is kept.
+  */
++const SCENES = [
++  "SCENE 01 — THE DOOR",
++  "SCENE 02 — THE ROOM",
++  "SCENE 03 — THE SCREEN",
++  "SCENE 04 — THE DEEP",
++  "SCENE 05 — THE GATE",
++];
++
+ export default function BeyondTheScreen() {
+   const containerRef = useRef<HTMLDivElement>(null);
++  const hudRef = useRef<HTMLDivElement>(null);
+ 
+   useEffect(() => {
+     const container = containerRef.current;
+@@ -46,7 +53,13 @@ export default function BeyondTheScreen() {
+     }
+     container.appendChild(world.domElement);
+ 
+-    const runway = document.getElementById("beyond-scroll-runway");
++    const roomEl = document.getElementById("journey-room");
++    const digitalEl = document.getElementById("journey-digital");
++    const aboutEl = document.getElementById("about");
++    const hud = hudRef.current;
++    const sceneEl = hud?.querySelector<HTMLElement>("[data-hud-scene]");
++    const timeEl = hud?.querySelector<HTMLElement>("[data-hud-time]");
++    const depthEl = hud?.querySelector<HTMLElement>("[data-hud-depth]");
+     const { state } = world;
+     const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+ 
+@@ -61,10 +74,9 @@ export default function BeyondTheScreen() {
+         const roomTl = gsap.timeline({
+           defaults: { ease: "none" },
+           scrollTrigger: {
+-            trigger: document.documentElement,
++            trigger: roomEl ?? document.documentElement,
+             start: "top top",
+-            endTrigger: runway ?? document.body,
+-            end: runway ? "top bottom" : "bottom bottom",
++            end: roomEl ? "bottom top" : "bottom bottom",
+             scrub,
+             invalidateOnRefresh: true,
+           },
+@@ -74,12 +86,12 @@ export default function BeyondTheScreen() {
+           .fromTo(state, { walk: 0 }, { walk: 1, duration: 4.2, ease: "power1.inOut", immediateRender: false }, 1.6);
+ 
+         // Phase 5-6: enter the screen and travel through the digital world
+-        if (runway) {
++        if (digitalEl) {
+           const digitalTl = gsap.timeline({
+             defaults: { ease: "none" },
+             scrollTrigger: {
+-              trigger: runway,
+-              start: "top bottom",
++              trigger: digitalEl,
++              start: "top top",
+               end: "bottom bottom",
+               scrub,
+               invalidateOnRefresh: true,
+@@ -91,6 +103,44 @@ export default function BeyondTheScreen() {
+             .fromTo(state, { depthPre: 0 }, { depthPre: DEPTH_PRE_MAX, duration: 1.9, immediateRender: false }, 0)
+             .fromTo(state, { depthMain: 0 }, { depthMain: DEPTH_MAIN_MAX, duration: 8.1, ease: "power1.inOut", immediateRender: false }, 1.9);
+         }
++
++        // HUD: overall progress across both journey chapters.
++        const home = document.getElementById("home");
++        if (home && hud) {
++          const total = () => Math.max(1, (home.offsetHeight || 1) - window.innerHeight);
++          ScrollTrigger.create({
++            trigger: home,
++            start: "top top",
++            end: "bottom bottom",
++            onUpdate: (self) => {
++              const p = self.progress;
++              const idx = Math.min(SCENES.length - 1, Math.floor(p * SCENES.length));
++              if (sceneEl) sceneEl.textContent = SCENES[idx];
++              const secs = Math.round(p * total() / 60);
++              const mm = String(Math.floor(secs / 60)).padStart(2, "0");
++              const ss = String(secs % 60).padStart(2, "0");
++              if (timeEl) timeEl.textContent = `${mm}:${ss}`;
++              if (depthEl) depthEl.textContent = `${String(Math.round(state.depthMain + state.depthPre)).padStart(3, "0")} m`;
++            },
++          });
++        }
++
++        // Once the content curtain covers the canvas, stop drawing.
++        if (aboutEl) {
++          ScrollTrigger.create({
++            trigger: aboutEl,
++            start: "top top",
++            onToggle: (self) => {
++              world.setPaused(self.isActive || self.progress > 0);
++              container.style.visibility = self.progress > 0 ? "hidden" : "visible";
++            },
++          });
++          ScrollTrigger.create({
++            trigger: aboutEl,
++            start: "top 80%",
++            onToggle: (self) => hud?.classList.toggle("is-hidden", self.progress > 0),
++          });
++        }
+       }, container);
+ 
+     world.setReducedMotion(motionQuery.matches);
+@@ -158,10 +208,19 @@ export default function BeyondTheScreen() {
+   }, []);
+ 
+   return (
+-    <div
+-      ref={containerRef}
+-      className="beyond-screen-background"
+-      aria-hidden="true"
+-    />
++    <>
++      <div
++        ref={containerRef}
++        className="beyond-screen-background"
++        aria-hidden="true"
++      />
++      <div ref={hudRef} className="hud" aria-hidden="true">
++        <span className="hud__rec"><i /> REC</span>
++        <span data-hud-scene>{SCENES[0]}</span>
++        <span data-hud-time>00:00</span>
++        <span data-hud-depth>000 m</span>
++      </div>
++      <a className="hud__skip" href="#about">Skip intro ↓</a>
++    </>
+   );
+ }
+diff --git a/src/app/components/BeyondTheScreen/scene.ts b/src/app/components/BeyondTheScreen/scene.ts
+index 27ff322..d284219 100644
+--- a/src/app/components/BeyondTheScreen/scene.ts
++++ b/src/app/components/BeyondTheScreen/scene.ts
+@@ -379,7 +379,14 @@ export function createScene(container: HTMLElement) {
+     }
+   }
+ 
++  let paused = false;
++  function setPaused(value: boolean) {
++    paused = value;
++    if (!value) needsFrame = true;
++  }
++
+   function render(rawTime: number) {
++    if (paused) return;
+     const t = reducedMotion ? 0 : rawTime;
+     const { w, h } = size();
+     const pr = renderer.getPixelRatio();
+@@ -457,7 +464,7 @@ export function createScene(container: HTMLElement) {
+     canvas.remove();
+   }
+ 
+-  return { state, domElement: canvas, resize, render, setReducedMotion, dispose };
++  return { state, domElement: canvas, resize, render, setReducedMotion, setPaused, dispose };
+ }
+ 
+ export type World = ReturnType<typeof createScene>;
+diff --git a/src/app/components/MobileNav.tsx b/src/app/components/MobileNav.tsx
+deleted file mode 100644
+index 258546f..0000000
+--- a/src/app/components/MobileNav.tsx
++++ /dev/null
+@@ -1,65 +0,0 @@
+-"use client";
+-
+-import { useEffect, useId, useState } from "react";
+-import { Menu, X } from "lucide-react";
+-
+-const links = [
+-  { href: "#home", label: "Home" },
+-  { href: "#about", label: "About" },
+-  { href: "#events", label: "Events" },
+-  { href: "#team", label: "Our Team" },
+-  { href: "#contact", label: "Contact" },
+-];
+-
+-/**
+- * Touch-friendly menu for narrow screens. The desktop `.nav-links` row is
+- * untouched; this button/panel is only displayed at <= 600px (see globals.css).
+- */
+-export default function MobileNav() {
+-  const [open, setOpen] = useState(false);
+-  const panelId = useId();
+-
+-  useEffect(() => {
+-    if (!open) return;
+-    const onKey = (event: KeyboardEvent) => {
+-      if (event.key === "Escape") setOpen(false);
+-    };
+-    const onResize = () => {
+-      if (window.innerWidth > 600) setOpen(false);
+-    };
+-    window.addEventListener("keydown", onKey);
+-    window.addEventListener("resize", onResize);
+-    return () => {
+-      window.removeEventListener("keydown", onKey);
+-      window.removeEventListener("resize", onResize);
+-    };
+-  }, [open]);
+-
+-  return (
+-    <div className="mobile-nav">
+-      <button
+-        type="button"
+-        className="mobile-nav-toggle"
+-        aria-expanded={open}
+-        aria-controls={panelId}
+-        aria-label={open ? "Close menu" : "Open menu"}
+-        onClick={() => setOpen((v) => !v)}
+-      >
+-        {open ? <X size={22} /> : <Menu size={22} />}
+-      </button>
+-
+-      <nav
+-        id={panelId}
+-        className={`mobile-nav-panel${open ? " is-open" : ""}`}
+-        aria-label="Primary"
+-        hidden={!open}
+-      >
+-        {links.map((link) => (
+-          <a key={link.href} href={link.href} onClick={() => setOpen(false)}>
+-            {link.label}
+-          </a>
+-        ))}
+-      </nav>
+-    </div>
+-  );
+-}
+diff --git a/src/app/components/Opening.tsx b/src/app/components/Opening.tsx
+new file mode 100644
+index 0000000..a70e2c9
+--- /dev/null
++++ b/src/app/components/Opening.tsx
+@@ -0,0 +1,51 @@
++import { SITE } from "../data/site";
++
++/**
++ * The opening of the site. The fixed WebGL canvas is the picture; this just
++ * supplies scroll length and 100vh typographic "beats" laid over it.
++ * #journey-room: door -> room -> laptop.  #journey-digital: portal -> deep -> gate.
++ */
++function Beat({ children, className = "" }: { children: React.ReactNode; className?: string }) {
++  return <div className={`beat ${className}`}>{children}</div>;
++}
++
++export default function Opening() {
++  return (
++    <div id="home" className="opening">
++      <div id="journey-room" className="journey journey--room">
++        <Beat className="beat--hero">
++          <p className="eyebrow">{SITE.institute.toUpperCase()}</p>
++          <h1 className="hero__title">
++            <span>THINK.</span>
++            <span>CREATE.</span>
++            <span className="hero__accent">INNOVATE.</span>
++          </h1>
++          <p className="hero__desc">
++            A community of engineers, innovators and creators. Exploring
++            technology, sharing ideas and building what comes next.
++          </p>
++          <div className="hero__actions">
++            <a className="btn btn--solid" href="#events">Explore events <span aria-hidden>↗</span></a>
++            <a className="btn btn--line" href="#about">About us</a>
++          </div>
++          <span className="hero__scroll">SCROLL TO EXPLORE <i aria-hidden /></span>
++          <span className="hero__side" aria-hidden>ENGINEERING THE FUTURE</span>
++        </Beat>
++        <Beat className="beat--cap"><p className="cap">Every build begins behind a door.</p></Beat>
++        <Beat className="beat--cap beat--right"><p className="cap">Someone is already inside, working.</p></Beat>
++        <Beat className="beat--cap"><p className="cap">Come closer.</p></Beat>
++      </div>
++
++      <div id="journey-digital" className="journey journey--digital">
++        <Beat className="beat--cap"><p className="cap">The screen is a doorway too.</p></Beat>
++        <Beat className="beat--cap beat--right"><p className="cap">Beyond it, a world made of ideas.</p></Beat>
++        <Beat className="beat--cap"><p className="cap">Signal, structure, systems.</p></Beat>
++        <Beat className="beat--cap beat--right"><p className="cap">Keep going.</p></Beat>
++        <Beat className="beat--gate">
++          <p className="eyebrow">IEI × ISTE · NITTE</p>
++          <a className="gate__link" href="#about">Enter the community <span aria-hidden>↓</span></a>
++        </Beat>
++      </div>
++    </div>
++  );
++}
+diff --git a/src/app/components/SiteEffects.tsx b/src/app/components/SiteEffects.tsx
+new file mode 100644
+index 0000000..ec81921
+--- /dev/null
++++ b/src/app/components/SiteEffects.tsx
+@@ -0,0 +1,33 @@
++"use client";
++
++import { useEffect } from "react";
++
++/** Scroll-reveal for `[data-reveal]` nodes. No-op under reduced motion. */
++export default function SiteEffects() {
++  useEffect(() => {
++    const root = document.documentElement;
++    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
++    const nodes = Array.from(document.querySelectorAll<HTMLElement>("[data-reveal]"));
++    if (reduce || typeof IntersectionObserver === "undefined") {
++      nodes.forEach((n) => n.classList.add("is-in"));
++      return;
++    }
++    root.classList.add("reveal-ready");
++    const io = new IntersectionObserver(
++      (entries) =>
++        entries.forEach((e) => {
++          if (e.isIntersecting) {
++            e.target.classList.add("is-in");
++            io.unobserve(e.target);
++          }
++        }),
++      { rootMargin: "0px 0px -8% 0px", threshold: 0.08 }
++    );
++    nodes.forEach((n) => io.observe(n));
++    return () => {
++      io.disconnect();
++      root.classList.remove("reveal-ready");
++    };
++  }, []);
++  return null;
++}
+diff --git a/src/app/components/SiteHeader.tsx b/src/app/components/SiteHeader.tsx
+new file mode 100644
+index 0000000..90e878c
+--- /dev/null
++++ b/src/app/components/SiteHeader.tsx
+@@ -0,0 +1,100 @@
++"use client";
++
++import { useEffect, useState } from "react";
++import { NAV_LINKS, SITE } from "../data/site";
++
++const IDS = NAV_LINKS.map((l) => l.href.slice(1));
++
++export default function SiteHeader() {
++  const [open, setOpen] = useState(false);
++  const [active, setActive] = useState("home");
++  const [solid, setSolid] = useState(false);
++
++  useEffect(() => {
++    const onScroll = () => setSolid(window.scrollY > 40);
++    onScroll();
++    window.addEventListener("scroll", onScroll, { passive: true });
++
++    const targets = IDS.map((id) => document.getElementById(id)).filter(
++      (el): el is HTMLElement => Boolean(el)
++    );
++    const io = new IntersectionObserver(
++      (entries) => {
++        entries.forEach((e) => {
++          if (e.isIntersecting) setActive(e.target.id);
++        });
++      },
++      { rootMargin: "-45% 0px -50% 0px" }
++    );
++    targets.forEach((t) => io.observe(t));
++
++    return () => {
++      window.removeEventListener("scroll", onScroll);
++      io.disconnect();
++    };
++  }, []);
++
++  useEffect(() => {
++    if (!open) return;
++    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
++    window.addEventListener("keydown", onKey);
++    document.documentElement.classList.add("nav-open");
++    return () => {
++      window.removeEventListener("keydown", onKey);
++      document.documentElement.classList.remove("nav-open");
++    };
++  }, [open]);
++
++  return (
++    <header className={`nav${solid ? " is-solid" : ""}${open ? " is-open" : ""}`}>
++      <div className="nav__bar">
++        <a href="#home" className="wordmark" aria-label="IEI × ISTE NITTE — home">
++          <span>IEI</span>
++          <i>×</i>
++          <span>ISTE</span>
++          <small>{SITE.campus}</small>
++        </a>
++
++        <nav className="nav__links" aria-label="Primary">
++          {NAV_LINKS.map((l) => (
++            <a
++              key={l.href}
++              href={l.href}
++              aria-current={active === l.href.slice(1) ? "true" : undefined}
++            >
++              {l.label}
++            </a>
++          ))}
++        </nav>
++
++        <a href="#events" className="nav__cta">
++          Explore events <span aria-hidden>↗</span>
++        </a>
++
++        <button
++          type="button"
++          className="burger"
++          aria-expanded={open}
++          aria-controls="mobile-menu"
++          aria-label={open ? "Close menu" : "Open menu"}
++          onClick={() => setOpen((v) => !v)}
++        >
++          <span />
++          <span />
++        </button>
++      </div>
++
++      <div id="mobile-menu" className="menu" hidden={!open}>
++        <nav aria-label="Mobile">
++          {NAV_LINKS.map((l, i) => (
++            <a key={l.href} href={l.href} onClick={() => setOpen(false)}>
++              <em>{String(i).padStart(2, "0")}</em>
++              {l.label}
++            </a>
++          ))}
++        </nav>
++        <p>{SITE.institute}</p>
++      </div>
++    </header>
++  );
++}
+diff --git a/src/app/components/sections/About.tsx b/src/app/components/sections/About.tsx
+new file mode 100644
+index 0000000..40eb5a5
+--- /dev/null
++++ b/src/app/components/sections/About.tsx
+@@ -0,0 +1,62 @@
++import SectionHead from "../ui/SectionHead";
++import { PILLARS, SITE } from "../../data/site";
++
++export default function About() {
++  return (
++    <section className="section about" id="about" aria-labelledby="about-title">
++      <div className="wrap">
++        <SectionHead index="01" label="WHO WE ARE" meta="IEI × ISTE / NITTE" />
++
++        <h2 className="display about__title" id="about-title" data-reveal>
++          <span className="line">More than a club.</span>
++          <span className="line line--dim">
++            <em>A community of builders.</em>
++          </span>
++        </h2>
++
++        <div className="about__body">
++          <dl className="about__meta" data-reveal>
++            <div>
++              <dt>Status</dt>
++              <dd>
++                <i className="pulse" aria-hidden /> Online
++              </dd>
++            </div>
++            <div>
++              <dt>Base</dt>
++              <dd>{SITE.institute}</dd>
++            </div>
++            <div>
++              <dt>Format</dt>
++              <dd>Student technical community</dd>
++            </div>
++          </dl>
++
++          <p className="about__lead" data-reveal>
++            IEI × ISTE NITTE brings together students who are passionate about
++            engineering, technology and innovation.
++          </p>
++
++          <p className="about__desc" data-reveal>
++            From technical workshops and competitions to collaborative projects
++            and knowledge-sharing sessions, we create opportunities to learn,
++            experiment and grow together.
++          </p>
++        </div>
++
++        <ol className="pillars">
++          {PILLARS.map((pillar) => (
++            <li className="pillar" key={pillar.title} data-reveal>
++              <span className="pillar__n">{pillar.numeral}</span>
++              <h3 className="pillar__t">{pillar.title}</h3>
++              <p className="pillar__d">{pillar.description}</p>
++              <span className="pillar__arrow" aria-hidden>
++                ↗
++              </span>
++            </li>
++          ))}
++        </ol>
++      </div>
++    </section>
++  );
++}
+diff --git a/src/app/components/sections/Contact.tsx b/src/app/components/sections/Contact.tsx
+new file mode 100644
+index 0000000..eed74c5
+--- /dev/null
++++ b/src/app/components/sections/Contact.tsx
+@@ -0,0 +1,34 @@
++import SectionHead from "../ui/SectionHead";
++import { SITE } from "../../data/site";
++
++export default function Contact() {
++  return (
++    <section className="section contact" id="contact" aria-labelledby="contact-title">
++      <div className="wrap">
++        <SectionHead index="05" label="GET CONNECTED" meta="OPEN CHANNEL" />
++
++        <h2 className="display contact__title" id="contact-title" data-reveal>
++          <span className="line">Your next idea</span>
++          <span className="line line--dim">
++            <em>starts here.</em>
++          </span>
++        </h2>
++
++        <div className="contact__row" data-reveal>
++          <p className="contact__copy">
++            Interested in technology, innovation and being part of something
++            bigger? Stay connected with us.
++          </p>
++
++          <a href={`mailto:${SITE.email}`} className="contact__cta">
++            <span>Get in touch</span>
++            <span className="contact__arrow" aria-hidden>
++              ↗
++            </span>
++            <small>{SITE.email}</small>
++          </a>
++        </div>
++      </div>
++    </section>
++  );
++}
+diff --git a/src/app/components/sections/Events.tsx b/src/app/components/sections/Events.tsx
+new file mode 100644
+index 0000000..8966022
+--- /dev/null
++++ b/src/app/components/sections/Events.tsx
+@@ -0,0 +1,77 @@
++import Frame from "../ui/Frame";
++import SectionHead from "../ui/SectionHead";
++import { EVENTS, SITE } from "../../data/site";
++
++function registerHref(title: string) {
++  const subject = encodeURIComponent(`Registration interest: ${title}`);
++  return `mailto:${SITE.email}?subject=${subject}`;
++}
++
++export default function Events() {
++  return (
++    <section className="section events" id="events" aria-labelledby="events-title">
++      <div className="wrap">
++        <SectionHead index="02" label="WHAT WE DO" meta="LEARN · BUILD · COMPETE" />
++
++        <div className="events__intro">
++          <h2 className="display events__title" id="events-title" data-reveal>
++            <span className="line">Experiences that</span>
++            <span className="line line--dim">
++              <em>move you forward.</em>
++            </span>
++          </h2>
++
++          <div className="events__aside" data-reveal>
++            <p>
++              Discover opportunities to explore your interests and challenge
++              yourself.
++            </p>
++            <a href="#contact" className="link-arrow">
++              Get involved <span aria-hidden>↗</span>
++            </a>
++          </div>
++        </div>
++
++        <div className="event-list">
++          {EVENTS.map((event, i) => (
++            <article className={`event event--${i + 1}`} key={event.number}>
++              <div className="event__media" data-reveal>
++                <Frame
++                  src={event.image}
++                  alt={event.imageAlt}
++                  ratio={i === 2 ? "21 / 9" : i === 1 ? "4 / 5" : "16 / 11"}
++                  label={`EVENT ${event.number}`}
++                  sizes="(max-width: 900px) 100vw, 62vw"
++                />
++              </div>
++
++              <div className="event__body" data-reveal>
++                <span className="event__num" aria-hidden>
++                  {event.number}
++                </span>
++                <p className="event__cat">{event.category}</p>
++                <h3 className="event__title">{event.title}</h3>
++                <p className="event__desc">{event.description}</p>
++
++                <dl className="event__meta">
++                  <div>
++                    <dt>Status</dt>
++                    <dd>{event.status}</dd>
++                  </div>
++                </dl>
++
++                <a className="btn btn--line" href={registerHref(event.title)}>
++                  Register interest <span aria-hidden>↗</span>
++                </a>
++              </div>
++            </article>
++          ))}
++        </div>
++
++        <p className="events__note" data-reveal>
++          EVENT LISTINGS AND REGISTRATIONS WILL BE AVAILABLE HERE.
++        </p>
++      </div>
++    </section>
++  );
++}
+diff --git a/src/app/components/sections/Footer.tsx b/src/app/components/sections/Footer.tsx
+new file mode 100644
+index 0000000..449743f
+--- /dev/null
++++ b/src/app/components/sections/Footer.tsx
+@@ -0,0 +1,41 @@
++import { NAV_LINKS, SITE } from "../../data/site";
++
++export default function Footer() {
++  return (
++    <footer className="footer">
++      <div className="wrap">
++        <div className="footer__grid">
++          <div className="footer__brand">
++            <a href="#home" className="wordmark" aria-label="IEI × ISTE — back to start">
++              <span>IEI</span>
++              <i>×</i>
++              <span>ISTE</span>
++            </a>
++            <p>{SITE.tagline}</p>
++          </div>
++
++          <nav className="footer__nav" aria-label="Footer">
++            {NAV_LINKS.filter((l) => l.href !== "#home").map((link) => (
++              <a key={link.href} href={link.href}>
++                {link.label}
++              </a>
++            ))}
++          </nav>
++
++          <div className="footer__where">
++            <span>{SITE.institute}</span>
++            <a href={`mailto:${SITE.email}`}>{SITE.email}</a>
++          </div>
++        </div>
++
++        <div className="footer__bar">
++          <span>
++            © {SITE.year} IEI × ISTE NITTE. All rights reserved.
++          </span>
++          <span className="footer__end">// end of transmission</span>
++          <a href="#home">Back to start ↑</a>
++        </div>
++      </div>
++    </footer>
++  );
++}
+diff --git a/src/app/components/sections/Gallery.tsx b/src/app/components/sections/Gallery.tsx
+new file mode 100644
+index 0000000..df9f763
+--- /dev/null
++++ b/src/app/components/sections/Gallery.tsx
+@@ -0,0 +1,24 @@
++import SectionHead from "../ui/SectionHead";
++import GalleryViewer from "./GalleryViewer";
++import { GALLERY } from "../../data/site";
++
++export default function Gallery() {
++  return (
++    <section className="section gallery-section" id="gallery" aria-labelledby="gallery-title">
++      <div className="wrap">
++        <SectionHead index="04" label="IN FRAMES" meta={`${String(GALLERY.length).padStart(2, "0")} FRAMES`} />
++
++        <h2 className="display gallery__title" id="gallery-title" data-reveal>
++          <span className="line">The community,</span>
++          <span className="line line--dim">
++            <em>in frames.</em>
++          </span>
++        </h2>
++      </div>
++
++      <div className="wrap wrap--wide">
++        <GalleryViewer items={GALLERY} />
++      </div>
++    </section>
++  );
++}
+diff --git a/src/app/components/sections/GalleryViewer.tsx b/src/app/components/sections/GalleryViewer.tsx
+new file mode 100644
+index 0000000..2e36dd7
+--- /dev/null
++++ b/src/app/components/sections/GalleryViewer.tsx
+@@ -0,0 +1,121 @@
++"use client";
++
++import Image from "next/image";
++import { useCallback, useEffect, useRef, useState } from "react";
++import Frame from "../ui/Frame";
++import type { GalleryItem } from "../../data/site";
++
++const RATIOS = ["16 / 10", "3 / 4", "3 / 4", "16 / 10", "21 / 9", "3 / 4"];
++
++/**
++ * Asymmetric photographic layout (a swipeable rail on phones). Frames that
++ * have a real `image` open in a native <dialog> lightbox with keyboard
++ * navigation; placeholders stay inert until photography is added.
++ */
++export default function GalleryViewer({ items }: { items: GalleryItem[] }) {
++  const dialogRef = useRef<HTMLDialogElement>(null);
++  const [index, setIndex] = useState<number | null>(null);
++
++  const withImages = items
++    .map((item, i) => ({ item, i }))
++    .filter(({ item }) => Boolean(item.image));
++
++  const open = useCallback((i: number) => {
++    setIndex(i);
++    dialogRef.current?.showModal();
++  }, []);
++
++  const step = useCallback(
++    (dir: 1 | -1) => {
++      if (index === null || withImages.length === 0) return;
++      const pos = withImages.findIndex(({ i }) => i === index);
++      const next = withImages[(pos + dir + withImages.length) % withImages.length];
++      setIndex(next.i);
++    },
++    [index, withImages]
++  );
++
++  useEffect(() => {
++    if (index === null) return;
++    const onKey = (event: KeyboardEvent) => {
++      if (event.key === "ArrowRight") step(1);
++      if (event.key === "ArrowLeft") step(-1);
++    };
++    window.addEventListener("keydown", onKey);
++    return () => window.removeEventListener("keydown", onKey);
++  }, [index, step]);
++
++  const current = index !== null ? items[index] : null;
++
++  return (
++    <>
++      <div className="gallery">
++        {items.map((item, i) => {
++          const frame = (
++            <Frame
++              src={item.image}
++              alt={item.alt}
++              ratio={RATIOS[i % RATIOS.length]}
++              label={`FRAME ${String(i + 1).padStart(2, "0")}`}
++              sizes="(max-width: 900px) 82vw, 56vw"
++            />
++          );
++          return (
++            <figure className={`shot shot--${i + 1}`} key={item.id} data-reveal>
++              {item.image ? (
++                <button
++                  type="button"
++                  className="shot__open"
++                  onClick={() => open(i)}
++                  aria-label={`Open photograph: ${item.caption}`}
++                >
++                  {frame}
++                </button>
++              ) : (
++                frame
++              )}
++              <figcaption>
++                <span>FIG. {String(i + 1).padStart(2, "0")}</span>
++                <strong>{item.caption}</strong>
++                <span>{item.tag}</span>
++              </figcaption>
++            </figure>
++          );
++        })}
++      </div>
++
++      <dialog
++        ref={dialogRef}
++        className="lightbox"
++        onClose={() => setIndex(null)}
++        onClick={(event) => {
++          if (event.target === dialogRef.current) dialogRef.current?.close();
++        }}
++      >
++        {current?.image ? (
++          <div className="lightbox__inner">
++            <div className="lightbox__stage">
++              <Image src={current.image} alt={current.alt} fill sizes="100vw" />
++            </div>
++            <div className="lightbox__bar">
++              <span>
++                {current.caption} — {current.tag}
++              </span>
++              <span className="lightbox__ctrl">
++                <button type="button" onClick={() => step(-1)} aria-label="Previous photograph">
++                  ←
++                </button>
++                <button type="button" onClick={() => step(1)} aria-label="Next photograph">
++                  →
++                </button>
++                <button type="button" onClick={() => dialogRef.current?.close()} aria-label="Close">
++                  Close
++                </button>
++              </span>
++            </div>
++          </div>
++        ) : null}
++      </dialog>
++    </>
++  );
++}
+diff --git a/src/app/components/sections/Team.tsx b/src/app/components/sections/Team.tsx
+new file mode 100644
+index 0000000..4498f3f
+--- /dev/null
++++ b/src/app/components/sections/Team.tsx
+@@ -0,0 +1,40 @@
++import SectionHead from "../ui/SectionHead";
++import TeamDirectory from "./TeamDirectory";
++import { TEAM } from "../../data/site";
++
++export default function Team() {
++  return (
++    <section className="section team" id="team" aria-labelledby="team-title">
++      <div className="wrap">
++        <SectionHead index="03" label="THE PEOPLE BEHIND IT" meta="CORE TEAM" />
++
++        <div className="team__intro">
++          <h2 className="display team__title" id="team-title" data-reveal>
++            <span className="line">Great ideas.</span>
++            <span className="line line--dim">
++              <em>Better together.</em>
++            </span>
++          </h2>
++
++          <div className="team__aside" data-reveal>
++            <p>
++              Meet the people who make our community happen. A team of students
++              working together to create, organize and inspire.
++            </p>
++            <a href="#contact" className="btn btn--solid">
++              Meet the community <span aria-hidden>↗</span>
++            </a>
++          </div>
++        </div>
++
++        <div data-reveal>
++          <TeamDirectory members={TEAM} />
++        </div>
++
++        <p className="team__note" data-reveal>
++          CORE TEAM PHOTOGRAPHS &amp; PROFILES COMING SOON
++        </p>
++      </div>
++    </section>
++  );
++}
+diff --git a/src/app/components/sections/TeamDirectory.tsx b/src/app/components/sections/TeamDirectory.tsx
+new file mode 100644
+index 0000000..2e248b7
+--- /dev/null
++++ b/src/app/components/sections/TeamDirectory.tsx
+@@ -0,0 +1,71 @@
++"use client";
++
++import { useState } from "react";
++import Frame from "../ui/Frame";
++import type { TeamMember } from "../../data/site";
++
++/**
++ * Cinematic team directory: large names on the left, a sticky portrait on the
++ * right that follows hover / focus / tap. On phones each row carries its own
++ * small portrait instead.
++ */
++export default function TeamDirectory({ members }: { members: TeamMember[] }) {
++  const [active, setActive] = useState(0);
++  const current = members[active];
++
++  return (
++    <div className="directory">
++      <ul className="directory__list">
++        {members.map((member, i) => {
++          const name = member.name ?? "Name to be announced";
++          return (
++            <li key={member.id}>
++              <button
++                type="button"
++                className={`member${i === active ? " is-active" : ""}`}
++                onMouseEnter={() => setActive(i)}
++                onFocus={() => setActive(i)}
++                onClick={() => setActive(i)}
++                aria-current={i === active}
++              >
++                <span className="member__idx">{String(i + 1).padStart(2, "0")}</span>
++                <span className="member__main">
++                  <span className={`member__name${member.name ? "" : " is-placeholder"}`}>
++                    {name}
++                  </span>
++                  <span className="member__role">{member.role}</span>
++                </span>
++                <span className="member__society">{member.society}</span>
++                <span className="member__thumb" aria-hidden>
++                  <Frame src={member.image} alt="" ratio="4 / 5" label="" sizes="96px" />
++                </span>
++              </button>
++            </li>
++          );
++        })}
++      </ul>
++
++      <aside className="directory__preview" aria-live="polite">
++        <Frame
++          key={current.id}
++          src={current.image}
++          alt={current.name ? `Portrait of ${current.name}` : `${current.role} portrait`}
++          ratio="4 / 5"
++          label="PORTRAIT"
++          sizes="(max-width: 900px) 0px, 36vw"
++          className="directory__frame"
++        />
++        <div className="directory__caption">
++          <span>
++            {String(active + 1).padStart(2, "0")} / {String(members.length).padStart(2, "0")}
++          </span>
++          <strong>{current.role}</strong>
++          <span>{current.society === "Joint" ? "IEI × ISTE" : current.society}</span>
++        </div>
++        <p className="directory__bio">
++          {current.bio ?? "Profile coming soon."}
++        </p>
++      </aside>
++    </div>
++  );
++}
+diff --git a/src/app/components/ui/Frame.tsx b/src/app/components/ui/Frame.tsx
+new file mode 100644
+index 0000000..f92fe7b
+--- /dev/null
++++ b/src/app/components/ui/Frame.tsx
+@@ -0,0 +1,57 @@
++import Image from "next/image";
++
++interface FrameProps {
++  src?: string;
++  alt: string;
++  /** CSS aspect-ratio value, e.g. "16 / 10". */
++  ratio: string;
++  /** Shown inside the placeholder, e.g. "PORTRAIT". */
++  label?: string;
++  sizes?: string;
++  priority?: boolean;
++  className?: string;
++}
++
++/**
++ * A photograph slot. With `src` it renders the real image; without it, an
++ * art-directed placeholder with crop marks so layouts can be judged before
++ * photography exists. Swap images by editing src/app/data/site.ts.
++ */
++export default function Frame({
++  src,
++  alt,
++  ratio,
++  label = "PHOTOGRAPH",
++  sizes = "(max-width: 900px) 100vw, 60vw",
++  priority,
++  className = "",
++}: FrameProps) {
++  return (
++    <div
++      className={`frame ${src ? "frame--filled" : "frame--empty"} ${className}`}
++      style={{ aspectRatio: ratio }}
++    >
++      {src ? (
++        <Image
++          src={src}
++          alt={alt}
++          fill
++          sizes={sizes}
++          priority={priority}
++          className="frame__img"
++        />
++      ) : (
++        <>
++          <span className="frame__tick frame__tick--tl" aria-hidden />
++          <span className="frame__tick frame__tick--tr" aria-hidden />
++          <span className="frame__tick frame__tick--bl" aria-hidden />
++          <span className="frame__tick frame__tick--br" aria-hidden />
++          <span className="frame__label">
++            {label}
++            <small>{ratio.replace(/\s/g, "")} · placeholder</small>
++          </span>
++        </>
++      )}
++    </div>
++  );
++}
+diff --git a/src/app/components/ui/SectionHead.tsx b/src/app/components/ui/SectionHead.tsx
+new file mode 100644
+index 0000000..59d5463
+--- /dev/null
++++ b/src/app/components/ui/SectionHead.tsx
+@@ -0,0 +1,16 @@
++interface SectionHeadProps {
++  index: string;
++  label: string;
++  meta?: string;
++}
++
++/** Thin-ruled section header: index, label and optional right-hand meta. */
++export default function SectionHead({ index, label, meta }: SectionHeadProps) {
++  return (
++    <div className="sec-head" data-reveal>
++      <span className="sec-head__idx">{index}</span>
++      <span className="sec-head__label">{label}</span>
++      {meta ? <span className="sec-head__meta">{meta}</span> : null}
++    </div>
++  );
++}
+diff --git a/src/app/data/site.ts b/src/app/data/site.ts
+new file mode 100644
+index 0000000..c74ad11
+--- /dev/null
++++ b/src/app/data/site.ts
+@@ -0,0 +1,126 @@
++/**
++ * Single source of truth for site copy and editable content.
++ * Everything a non-developer needs to change (photos, names, events, emails)
++ * lives in this folder; the components only render it.
++ */
++
++export const SITE = {
++  name: "IEI × ISTE",
++  campus: "NITTE",
++  institute: "NMAM Institute of Technology · Nitte",
++  tagline: "Engineering minds. Connecting ideas. Building tomorrow.",
++  // TODO: replace with the community's real address.
++  email: "contact@iei-iste-nitte.example",
++  year: 2026,
++} as const;
++
++export const NAV_LINKS = [
++  { href: "#home", label: "Home" },
++  { href: "#about", label: "About" },
++  { href: "#events", label: "Events" },
++  { href: "#team", label: "Our Team" },
++  { href: "#gallery", label: "Gallery" },
++  { href: "#contact", label: "Contact" },
++] as const;
++
++export const PILLARS = [
++  {
++    numeral: "I",
++    title: "Technical Excellence",
++    description: "Learn, experiment and develop skills beyond the classroom.",
++  },
++  {
++    numeral: "II",
++    title: "Innovation & Ideas",
++    description: "Turn creative ideas into meaningful projects and solutions.",
++  },
++  {
++    numeral: "III",
++    title: "Community & Collaboration",
++    description: "Connect with curious minds and build something together.",
++  },
++] as const;
++
++export interface EventItem {
++  number: string;
++  category: string;
++  title: string;
++  description: string;
++  /** Shown as the status line until real dates are published. */
++  status: string;
++  /** Path under /public, e.g. "/images/events/workshops.jpg". Leave empty for the placeholder frame. */
++  image?: string;
++  imageAlt: string;
++}
++
++export const EVENTS: EventItem[] = [
++  {
++    number: "01",
++    category: "WORKSHOP",
++    title: "Technical Workshops",
++    description: "Hands-on learning through practical technical sessions.",
++    status: "Dates to be announced",
++    image: undefined,
++    imageAlt: "Students at a technical workshop",
++  },
++  {
++    number: "02",
++    category: "COMPETITION",
++    title: "Hackathons & Challenges",
++    description: "Build, compete and bring innovative ideas to life.",
++    status: "Dates to be announced",
++    image: undefined,
++    imageAlt: "Teams competing at a hackathon",
++  },
++  {
++    number: "03",
++    category: "COMMUNITY",
++    title: "Talks & Seminars",
++    description: "Learn from experts, innovators and fellow students.",
++    status: "Dates to be announced",
++    image: undefined,
++    imageAlt: "A speaker presenting at a seminar",
++  },
++];
++
++export interface TeamMember {
++  id: string;
++  /** Leave empty until the member is confirmed; the UI shows a placeholder. */
++  name?: string;
++  role: string;
++  /** Which society the role belongs to. */
++  society: "IEI" | "ISTE" | "Joint";
++  /** Path under /public, e.g. "/images/team/chairperson-iei.jpg" (4:5 portrait works best). */
++  image?: string;
++  /** One or two lines shown beside the portrait. */
++  bio?: string;
++}
++
++export const TEAM: TeamMember[] = [
++  { id: "chair-iei", role: "Chairperson", society: "IEI" },
++  { id: "chair-iste", role: "Chairperson", society: "ISTE" },
++  { id: "vice-chair", role: "Vice Chairperson", society: "Joint" },
++  { id: "secretary", role: "Secretary", society: "Joint" },
++  { id: "treasurer", role: "Treasurer", society: "Joint" },
++  { id: "tech-lead", role: "Technical Lead", society: "Joint" },
++  { id: "design-lead", role: "Design & Media Lead", society: "Joint" },
++  { id: "events-lead", role: "Events Lead", society: "Joint" },
++];
++
++export interface GalleryItem {
++  id: string;
++  caption: string;
++  tag: string;
++  /** Path under /public, e.g. "/images/gallery/01.jpg". Leave empty for the placeholder frame. */
++  image?: string;
++  alt: string;
++}
++
++export const GALLERY: GalleryItem[] = [
++  { id: "g1", caption: "Workshop", tag: "Learn", alt: "Workshop session" },
++  { id: "g2", caption: "Hackathon", tag: "Compete", alt: "Hackathon teams at work" },
++  { id: "g3", caption: "Seminar", tag: "Listen", alt: "Seminar audience" },
++  { id: "g4", caption: "The team", tag: "People", alt: "Core team together" },
++  { id: "g5", caption: "Build night", tag: "Build", alt: "Late-night build session" },
++  { id: "g6", caption: "Campus", tag: "Place", alt: "NMAM Institute of Technology campus" },
++];
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 0055080..ecbb0c1 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -1,1163 +1,7 @@
+-
+ @import "tailwindcss";
+-
+-:root {
+-  --background: #070914;
+-  --foreground: #f5f7ff;
+-  --muted: #9299b2;
+-  --blue: #5578ff;
+-  --violet: #a16bff;
+-  --cyan: #54d9ff;
+-  --border: rgba(255, 255, 255, 0.09);
+-}
+-
+-* {
+-  box-sizing: border-box;
+-  scroll-behavior: smooth;
+-}
+-
+-html {
+-  background: var(--background);
+-}
+-
+-body {
+-  margin: 0;
+-  background: var(--background);
+-  color: var(--foreground);
+-  font-family: Arial, Helvetica, sans-serif;
+-  overflow-x: hidden;
+-}
+-
+-a {
+-  color: inherit;
+-  text-decoration: none;
+-}
+-
+-button, a {
+-  -webkit-tap-highlight-color: transparent;
+-}
+-
+-::selection {
+-  background: #7864ff;
+-  color: white;
+-}
+-
+-/* NAVBAR */
+-
+-.navbar {
+-  height: 82px;
+-  width: 100%;
+-  padding: 0 7%;
+-  display: flex;
+-  align-items: center;
+-  justify-content: space-between;
+-  position: absolute;
+-  z-index: 20;
+-  top: 0;
+-  left: 0;
+-  border-bottom: 1px solid rgba(255,255,255,0.07);
+-  background: rgba(7, 9, 20, 0.55);
+-  backdrop-filter: blur(18px);
+-}
+-
+-.brand {
+-  display: flex;
+-  align-items: center;
+-  gap: 7px;
+-  font-size: 18px;
+-  font-weight: 800;
+-  letter-spacing: -0.8px;
+-}
+-
+-.brand-mark {
+-  background: linear-gradient(120deg, #ffffff, #aab8ff);
+-  background-clip: text;
+-  -webkit-background-clip: text;
+-  color: transparent;
+-}
+-
+-.brand-cross {
+-  color: #8d77ff;
+-  font-size: 22px;
+-}
+-
+-.brand-divider {
+-  height: 19px;
+-  width: 1px;
+-  background: rgba(255,255,255,0.2);
+-  margin: 0 5px;
+-}
+-
+-.brand-campus {
+-  font-size: 10px;
+-  letter-spacing: 2px;
+-  color: #a4abc3;
+-}
+-
+-.nav-links {
+-  display: flex;
+-  gap: 34px;
+-  align-items: center;
+-}
+-
+-.nav-links a {
+-  font-size: 12px;
+-  color: #a7adc1;
+-  transition: color 0.3s;
+-}
+-
+-.nav-links a:hover,
+-.nav-links a.active {
+-  color: white;
+-}
+-
+-.nav-cta,
+-.button-primary {
+-  display: inline-flex;
+-  align-items: center;
+-  justify-content: center;
+-  gap: 10px;
+-  background: linear-gradient(110deg, #5478ff, #9062f6);
+-  color: white;
+-  border-radius: 8px;
+-  font-size: 13px;
+-  font-weight: 600;
+-  transition: transform 0.3s, box-shadow 0.3s;
+-}
+-
+-.nav-cta {
+-  padding: 12px 17px;
+-}
+-
+-.nav-cta:hover,
+-.button-primary:hover {
+-  transform: translateY(-3px);
+-  box-shadow: 0 8px 35px rgba(100, 104, 255, 0.3);
+-}
+-
+-/* HERO */
+-
+-.hero {
+-  min-height: 100svh;
+-  position: relative;
+-  display: flex;
+-  align-items: center;
+-  overflow: hidden;
+-  isolation: isolate;
+-  padding: 150px 10% 95px;
+-}
+-
+-.hero-background {
+-  position: absolute;
+-  inset: 0;
+-  z-index: -1;
+-  overflow: hidden;
+-  background:
+-    radial-gradient(ellipse at 75% 40%, rgba(76, 60, 185, 0.17), transparent 43%),
+-    radial-gradient(ellipse at 15% 85%, rgba(22, 111, 197, 0.12), transparent 42%),
+-    #070914;
+-}
+-
+-.hero-grid {
+-  position: absolute;
+-  inset: -50%;
+-  opacity: 0.22;
+-  background-image:
+-    linear-gradient(rgba(117, 140, 255, 0.13) 1px, transparent 1px),
+-    linear-gradient(90deg, rgba(117, 140, 255, 0.13) 1px, transparent 1px);
+-  background-size: 65px 65px;
+-  transform: perspective(700px) rotateX(58deg) scale(1.6);
+-  transform-origin: center bottom;
+-  animation: gridMove 25s linear infinite;
+-  mask-image: linear-gradient(to bottom, transparent, black 35%, black 75%, transparent);
+-}
+-
+-@keyframes gridMove {
+-  from { background-position: 0 0; }
+-  to { background-position: 0 130px; }
+-}
+-
+-.orb {
+-  position: absolute;
+-  border-radius: 50%;
+-  filter: blur(90px);
+-  pointer-events: none;
+-  animation: orbFloat 12s ease-in-out infinite alternate;
+-}
+-
+-.orb-one {
+-  width: 420px;
+-  height: 420px;
+-  right: 8%;
+-  top: 17%;
+-  background: rgba(82, 79, 255, 0.22);
+-}
+-
+-.orb-two {
+-  width: 300px;
+-  height: 300px;
+-  right: 29%;
+-  bottom: 5%;
+-  background: rgba(30, 144, 255, 0.16);
+-  animation-delay: -4s;
+-}
+-
+-.orb-three {
+-  width: 220px;
+-  height: 220px;
+-  left: -5%;
+-  top: 25%;
+-  background: rgba(136, 72, 255, 0.14);
+-  animation-delay: -7s;
+-}
+-
+-@keyframes orbFloat {
+-  from { transform: translate(0, 0) scale(1); }
+-  to { transform: translate(-35px, 35px) scale(1.15); }
+-}
+-
+-.orbit {
+-  position: absolute;
+-  border: 1px solid rgba(133, 135, 255, 0.18);
+-  border-radius: 50%;
+-  right: 12%;
+-  top: 24%;
+-  width: 420px;
+-  height: 420px;
+-  animation: orbitSpin 30s linear infinite;
+-}
+-
+-.orbit-two {
+-  width: 550px;
+-  height: 550px;
+-  right: 7%;
+-  top: 16%;
+-  border-color: rgba(68, 195, 255, 0.12);
+-  animation-duration: 45s;
+-  animation-direction: reverse;
+-}
+-
+-.orbit-dot {
+-  position: absolute;
+-  width: 9px;
+-  height: 9px;
+-  background: #8c7bff;
+-  border-radius: 50%;
+-  top: 50%;
+-  left: -5px;
+-  box-shadow: 0 0 20px #8674ff;
+-}
+-
+-.dot-two {
+-  background: #53d5ff;
+-  box-shadow: 0 0 20px #53d5ff;
+-  top: 15%;
+-  left: 15%;
+-}
+-
+-@keyframes orbitSpin {
+-  to { transform: rotate(360deg); }
+-}
+-
+-.floating-symbol {
+-  position: absolute;
+-  color: rgba(170, 177, 255, 0.4);
+-  font-family: monospace;
+-  font-size: 23px;
+-  animation: symbolFloat 7s ease-in-out infinite;
+-}
+-
+-.symbol-one { right: 14%; top: 36%; }
+-.symbol-two { right: 32%; bottom: 22%; animation-delay: -2s; }
+-.symbol-three { right: 8%; bottom: 25%; animation-delay: -4s; }
+-
+-@keyframes symbolFloat {
+-  50% { transform: translateY(-20px) rotate(8deg); }
+-}
+-
+-.hero-content {
+-  max-width: 790px;
+-  width: 100%;
+-  position: relative;
+-  z-index: 2;
+-}
+-
+-.eyebrow,
+-.section-label {
+-  font-size: 10px;
+-  letter-spacing: 2.5px;
+-  font-weight: 700;
+-  color: #a5aecb;
+-}
+-
+-.eyebrow {
+-  display: inline-flex;
+-  align-items: center;
+-  gap: 11px;
+-  border: 1px solid rgba(133, 151, 255, 0.24);
+-  background: rgba(76, 86, 170, 0.1);
+-  padding: 11px 15px;
+-  border-radius: 30px;
+-  margin-bottom: 32px;
+-}
+-
+-.live-dot {
+-  width: 7px;
+-  height: 7px;
+-  border-radius: 50%;
+-  background: #64e5b0;
+-  box-shadow: 0 0 12px #64e5b0;
+-}
+-
+-.hero h1 {
+-  font-size: clamp(68px, 9vw, 118px);
+-  line-height: 0.91;
+-  letter-spacing: -7px;
+-  font-weight: 850;
+-  margin: 0;
+-}
+-
+-.gradient-text {
+-  background: linear-gradient(100deg, #7f91ff, #a979ff 48%, #56d9ff);
+-  -webkit-background-clip: text;
+-  background-clip: text;
+-  color: transparent;
+-}
+-
+-.outline-text {
+-  color: transparent;
+-  -webkit-text-stroke: 1.5px rgba(224, 229, 255, 0.78);
+-}
+-
+-.hero-description {
+-  max-width: 475px;
+-  color: #a8aec4;
+-  font-size: 16px;
+-  line-height: 1.9;
+-  margin: 28px 0;
+-}
+-
+-.hero-actions {
+-  display: flex;
+-  flex-wrap: wrap;
+-  gap: 15px;
+-}
+-
+-.button-primary {
+-  padding: 15px 21px;
+-}
+-
+-.button-secondary {
+-  padding: 15px 21px;
+-  border: 1px solid var(--border);
+-  border-radius: 8px;
+-  display: inline-flex;
+-  gap: 10px;
+-  align-items: center;
+-  font-size: 13px;
+-  color: #d7d9e8;
+-  transition: 0.3s;
+-}
+-
+-.button-secondary:hover {
+-  border-color: #8078ff;
+-  background: rgba(112, 100, 255, 0.08);
+-}
+-
+-.hero-bottom {
+-  position: absolute;
+-  left: 10%;
+-  right: 10%;
+-  bottom: 30px;
+-  display: flex;
+-  justify-content: space-between;
+-  align-items: center;
+-}
+-
+-.scroll-indicator {
+-  display: flex;
+-  align-items: center;
+-  gap: 12px;
+-  color: #a9b2d0;
+-  font-size: 9px;
+-  letter-spacing: 2px;
+-}
+-
+-.hero-location {
+-  color: #69728c;
+-  font-size: 9px;
+-  letter-spacing: 1.5px;
+-}
+-
+-.hero-side-label {
+-  position: absolute;
+-  right: 30px;
+-  top: 48%;
+-  writing-mode: vertical-rl;
+-  color: #68728e;
+-  font-size: 9px;
+-  letter-spacing: 3px;
+-}
+-
+-/* GENERAL SECTIONS */
+-
+-.section {
+-  padding: 115px 10%;
+-}
+-
+-.section-heading h2,
+-.events-heading h2,
+-.community-content h2,
+-.contact-section h2 {
+-  font-size: clamp(38px, 5vw, 61px);
+-  letter-spacing: -2.5px;
+-  line-height: 1.1;
+-  margin: 23px 0;
+-}
+-
+-.about-section {
+-  background: #0b0e1d;
+-}
+-
+-.about-content {
+-  display: grid;
+-  grid-template-columns: 1fr 1fr;
+-  gap: 60px;
+-  margin: 45px 0 60px;
+-}
+-
+-.about-lead {
+-  font-size: 23px;
+-  line-height: 1.55;
+-  color: #e1e4f6;
+-  max-width: 500px;
+-  margin: 0;
+-}
+-
+-.about-description {
+-  color: var(--muted);
+-  line-height: 1.9;
+-  font-size: 14px;
+-  max-width: 490px;
+-  margin: 0;
+-}
+-
+-.highlight-grid {
+-  display: grid;
+-  grid-template-columns: repeat(3, 1fr);
+-  gap: 17px;
+-}
+-
+-.highlight-card {
+-  position: relative;
+-  border: 1px solid var(--border);
+-  border-radius: 12px;
+-  background: linear-gradient(145deg, rgba(255,255,255,0.035), rgba(255,255,255,0.005));
+-  padding: 29px;
+-  min-height: 230px;
+-  transition: 0.35s;
+-}
+-
+-.highlight-card:hover {
+-  transform: translateY(-7px);
+-  border-color: rgba(129, 122, 255, 0.55);
+-  background: rgba(106, 96, 255, 0.06);
+-}
+-
+-.highlight-icon {
+-  width: 47px;
+-  height: 47px;
+-  border-radius: 10px;
+-  display: grid;
+-  place-items: center;
+-  color: #a99aff;
+-  background: rgba(129, 105, 255, 0.14);
+-}
+-
+-.highlight-card h3 {
+-  font-size: 17px;
+-  margin-top: 24px;
+-}
+-
+-.highlight-card p {
+-  font-size: 13px;
+-  line-height: 1.8;
+-  color: var(--muted);
+-}
+-
+-.card-arrow {
+-  position: absolute;
+-  top: 30px;
+-  right: 28px;
+-  color: #8d91ae;
+-}
+-
+-/* EVENTS */
+-
+-.events-section {
+-  background: #080a16;
+-}
+-
+-.section-topline,
+-.events-heading {
+-  display: flex;
+-  justify-content: space-between;
+-  align-items: center;
+-  gap: 30px;
+-}
+-
+-.events-heading {
+-  margin: 25px 0 48px;
+-}
+-
+-.events-heading p,
+-.contact-section > p {
+-  color: var(--muted);
+-  font-size: 14px;
+-  line-height: 1.8;
+-}
+-
+-.text-link {
+-  display: flex;
+-  align-items: center;
+-  gap: 9px;
+-  color: #b5aaff;
+-  font-size: 13px;
+-  white-space: nowrap;
+-}
+-
+-.event-grid {
+-  display: grid;
+-  grid-template-columns: repeat(3, 1fr);
+-  gap: 18px;
+-}
+-
+-.event-card {
+-  min-height: 350px;
+-  border: 1px solid var(--border);
+-  border-radius: 13px;
+-  padding: 26px;
+-  position: relative;
+-  display: flex;
+-  flex-direction: column;
+-  justify-content: space-between;
+-  overflow: hidden;
+-  transition: 0.35s;
+-}
+-
+-.event-card:hover {
+-  transform: translateY(-7px);
+-  border-color: rgba(143, 133, 255, 0.5);
+-}
+-
+-.event-card.blue {
+-  background: radial-gradient(ellipse at 50% 45%, rgba(54, 105, 255, 0.22), transparent 65%), #10172a;
+-}
+-
+-.event-card.purple {
+-  background: radial-gradient(ellipse at 50% 45%, rgba(145, 69, 255, 0.23), transparent 65%), #17112b;
+-}
+-
+-.event-card.cyan {
+-  background: radial-gradient(ellipse at 50% 45%, rgba(39, 192, 255, 0.19), transparent 65%), #0e1b29;
+-}
+-
+-.event-card-top {
+-  display: flex;
+-  justify-content: space-between;
+-  color: #a6b3d5;
+-  font-size: 9px;
+-  letter-spacing: 1.8px;
+-}
+-
+-.event-art {
+-  display: grid;
+-  place-items: center;
+-  height: 125px;
+-  color: #9caaff;
+-  filter: drop-shadow(0 0 22px rgba(116, 119, 255, 0.5));
+-  transition: transform 0.4s;
+-}
+-
+-.event-card:hover .event-art {
+-  transform: scale(1.12) rotate(-5deg);
+-}
+-
+-.event-card h3 {
+-  font-size: 20px;
+-  margin: 0 0 10px;
+-}
+-
+-.event-card p {
+-  font-size: 12px;
+-  line-height: 1.8;
+-  color: #a6aec5;
+-  max-width: 260px;
+-}
+-
+-.event-arrow {
+-  position: absolute;
+-  right: 26px;
+-  bottom: 29px;
+-  color: #bdc1de;
+-}
+-
+-.events-note {
+-  text-align: center;
+-  color: #737c98;
+-  font-size: 9px;
+-  letter-spacing: 2px;
+-  margin-top: 40px;
+-}
+-
+-/* COMMUNITY */
+-
+-.community-section {
+-  min-height: 600px;
+-  padding: 110px 10%;
+-  position: relative;
+-  overflow: hidden;
+-  text-align: center;
+-  background: #0b0e1d;
+-  display: flex;
+-  justify-content: center;
+-}
+-
+-.community-glow {
+-  position: absolute;
+-  width: 600px;
+-  height: 400px;
+-  background: rgba(111, 82, 255, 0.15);
+-  filter: blur(120px);
+-  top: 0;
+-  left: 50%;
+-  transform: translateX(-50%);
+-}
+-
+-.community-content {
+-  position: relative;
+-  max-width: 650px;
+-}
+-
+-.community-icon {
+-  margin: 32px auto 10px;
+-  width: 75px;
+-  height: 75px;
+-  display: grid;
+-  place-items: center;
+-  border-radius: 20px;
+-  background: linear-gradient(140deg, #536fff, #9a65fa);
+-  box-shadow: 0 0 55px rgba(115, 97, 255, 0.3);
+-}
+-
+-.community-content p {
+-  color: var(--muted);
+-  font-size: 14px;
+-  line-height: 1.9;
+-  max-width: 480px;
+-  margin: 0 auto 28px;
+-}
+-
+-.team-placeholder {
+-  margin-top: 50px;
+-  color: #737e9e;
+-  font-size: 9px;
+-  letter-spacing: 2px;
+-}
+-
+-/* CONTACT */
+-
+-.contact-section {
+-  text-align: center;
+-  background: #080a16;
+-}
+-
+-.contact-section > p {
+-  max-width: 440px;
+-  margin: 0 auto 30px;
+-}
+-
+-/* FOOTER */
+-
+-.footer {
+-  border-top: 1px solid var(--border);
+-  background: #070914;
+-  padding: 40px 10%;
+-  display: flex;
+-  align-items: center;
+-  justify-content: space-between;
+-  gap: 20px;
+-}
+-
+-.footer p {
+-  font-size: 11px;
+-  color: #838ba5;
+-}
+-
+-.footer-copy {
+-  color: #6e7690;
+-  font-size: 10px;
+-}
+-
+-/* RESPONSIVE */
+-
+-@media (max-width: 850px) {
+-  .navbar {
+-    padding: 0 5%;
+-  }
+-
+-  .nav-links {
+-    gap: 16px;
+-  }
+-
+-  .nav-links a {
+-    font-size: 11px;
+-  }
+-
+-  .nav-cta {
+-    padding: 10px;
+-    font-size: 11px;
+-  }
+-
+-  .hero {
+-    padding-left: 7%;
+-    padding-right: 7%;
+-  }
+-
+-  .hero-bottom {
+-    left: 7%;
+-    right: 7%;
+-  }
+-
+-  .orbit-one {
+-    right: -15%;
+-  }
+-
+-  .orbit-two {
+-    right: -22%;
+-  }
+-
+-  .section,
+-  .community-section {
+-    padding-left: 7%;
+-    padding-right: 7%;
+-  }
+-
+-  .highlight-grid,
+-  .event-grid {
+-    grid-template-columns: repeat(2, 1fr);
+-  }
+-
+-  .highlight-card:last-child,
+-  .event-card:last-child {
+-    grid-column: 1 / -1;
+-  }
+-
+-  .footer {
+-    padding-left: 7%;
+-    padding-right: 7%;
+-    flex-wrap: wrap;
+-  }
+-}
+-
+-@media (max-width: 600px) {
+-  .navbar {
+-    height: 70px;
+-  }
+-
+-  .brand {
+-    font-size: 16px;
+-  }
+-
+-  .brand-campus,
+-  .brand-divider {
+-    display: none;
+-  }
+-
+-  .nav-links {
+-    display: none;
+-  }
+-
+-  .nav-cta {
+-    font-size: 10px;
+-  }
+-
+-  .hero {
+-    min-height: 850px;
+-    min-height: 100svh;
+-    padding: 140px 7% 100px;
+-  }
+-
+-  .hero h1 {
+-    font-size: clamp(61px, 15vw, 83px);
+-    letter-spacing: -4px;
+-  }
+-
+-  .hero-description {
+-    font-size: 14px;
+-  }
+-
+-  .hero-actions {
+-    flex-direction: column;
+-    align-items: flex-start;
+-  }
+-
+-  .hero-actions a {
+-    width: 100%;
+-  }
+-
+-  .hero-side-label,
+-  .hero-location {
+-    display: none;
+-  }
+-
+-  .hero-bottom {
+-    bottom: 25px;
+-  }
+-
+-  .orbit {
+-    opacity: 0.4;
+-    right: -65%;
+-  }
+-
+-  .section {
+-    padding: 85px 7%;
+-  }
+-
+-  .section-heading h2,
+-  .events-heading h2,
+-  .community-content h2,
+-  .contact-section h2 {
+-    font-size: 39px;
+-    letter-spacing: -1.8px;
+-  }
+-
+-  .about-content {
+-    grid-template-columns: 1fr;
+-    gap: 20px;
+-    margin: 35px 0;
+-  }
+-
+-  .about-lead {
+-    font-size: 19px;
+-  }
+-
+-  .highlight-grid,
+-  .event-grid {
+-    grid-template-columns: 1fr;
+-  }
+-
+-  .highlight-card:last-child,
+-  .event-card:last-child {
+-    grid-column: auto;
+-  }
+-
+-  .events-heading,
+-  .section-topline {
+-    align-items: flex-start;
+-    flex-direction: column;
+-  }
+-
+-  .event-card {
+-    min-height: 310px;
+-  }
+-
+-  .community-section {
+-    padding: 85px 7%;
+-  }
+-
+-  .footer {
+-    padding: 35px 7%;
+-    flex-direction: column;
+-    align-items: flex-start;
+-  }
+-}
+-
+-/* MOBILE NAVIGATION (hamburger only exists on narrow screens) */
+-
+-.mobile-nav {
+-  display: none;
+-}
+-
+-html {
+-  overflow-x: clip;
+-}
+-
+-@media (max-width: 600px) {
+-  /* Keep the nav reachable while scrolling the long journey */
+-  .navbar {
+-    position: fixed;
+-    gap: 10px;
+-  }
+-
+-  .nav-cta {
+-    min-height: 44px;
+-    margin-left: auto;
+-  }
+-
+-  .mobile-nav {
+-    display: block;
+-  }
+-
+-  .mobile-nav-toggle {
+-    display: inline-flex;
+-    align-items: center;
+-    justify-content: center;
+-    width: 44px;
+-    height: 44px;
+-    border-radius: 10px;
+-    border: 1px solid var(--border);
+-    background: rgba(255, 255, 255, 0.04);
+-    color: #fff;
+-    cursor: pointer;
+-    touch-action: manipulation;
+-  }
+-
+-  .mobile-nav-panel {
+-    position: absolute;
+-    top: 100%;
+-    left: 0;
+-    right: 0;
+-    display: flex;
+-    flex-direction: column;
+-    padding: 8px 5% 16px;
+-    background: rgba(5, 8, 7, 0.985);
+-    backdrop-filter: blur(18px);
+-    -webkit-backdrop-filter: blur(18px);
+-    border-bottom: 1px solid var(--border);
+-  }
+-
+-  .mobile-nav-panel[hidden] {
+-    display: none;
+-  }
+-
+-  .mobile-nav-panel a {
+-    display: flex;
+-    align-items: center;
+-    min-height: 52px;
+-    font-size: 16px;
+-    color: #d6dbe8;
+-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+-    touch-action: manipulation;
+-  }
+-
+-  .mobile-nav-panel a:last-child {
+-    border-bottom: 0;
+-  }
+-
+-  /* "Scroll to explore" collided with the buttons: flow it after them */
+-  .hero-bottom {
+-    position: static;
+-    margin-top: 32px;
+-  }
+-
+-  .hero h1 {
+-    word-break: normal;
+-    overflow-wrap: anywhere;
+-  }
+-
+-  .community-glow {
+-    max-width: 100vw;
+-  }
+-
+-  .footer {
+-    overflow-wrap: anywhere;
+-  }
+-}
+-
+-/* Short landscape phones: shrink the hero so copy and door both fit */
+-@media (max-height: 480px) and (orientation: landscape) {
+-  .hero {
+-    min-height: 0;
+-    padding-top: 110px;
+-    padding-bottom: 60px;
+-  }
+-
+-  .hero h1 {
+-    font-size: clamp(40px, 9vh, 64px);
+-    letter-spacing: -2px;
+-  }
+-}
+-
+-/* ACCESSIBILITY: REDUCE MOTION */
+-
+-@media (prefers-reduced-motion: reduce) {
+-  *,
+-  *::before,
+-  *::after {
+-    scroll-behavior: auto !important;
+-    animation-duration: 0.01ms !important;
+-    animation-iteration-count: 1 !important;
+-    transition-duration: 0.01ms !important;
+-  }
+-}
+-
+-/* ==========================================
+-   IEI × ISTE — ENGINEERING ENVIRONMENT
+-========================================== */
+-
+-html {
+-  scroll-behavior: smooth;
+-  background: #080D18;
+-}
+-
+-body {
+-  margin: 0;
+-  min-height: 100vh;
+-  background: #080D18;
+-  position: relative;
+-}
+-
+-/* Global fixed canvas background */
+-
+-.engineering-background {
+-  position: fixed;
+-  inset: 0;
+-  width: 100%;
+-  height: 100vh;
+-  height: 100dvh;
+-  overflow: hidden;
+-  pointer-events: none;
+-  z-index: 0;
+-  background: #080D18;
+-}
+-
+-.engineering-canvas {
+-  display: block;
+-  width: 100%;
+-  height: 100%;
+-}
+-
+-.engineering-overlay {
+-  position: absolute;
+-  inset: 0;
+-  pointer-events: none;
+-  background:
+-    linear-gradient(
+-      180deg,
+-      rgba(8, 13, 24, 0.12) 0%,
+-      rgba(8, 13, 24, 0.04) 45%,
+-      rgba(8, 13, 24, 0.40) 100%
+-    ),
+-    radial-gradient(
+-      ellipse at center,
+-      transparent 25%,
+-      rgba(8, 13, 24, 0.45) 100%
+-    );
+-}
+-
+-/* Website content sits above the canvas */
+-
+-.site-content {
+-  position: relative;
+-  z-index: 1;
+-  min-height: 100vh;
+-}
+-
+-/* Main page layout */
+-
+-main {
+-  position: relative;
+-  min-height: 100vh;
+-}
+-
+-/* Remove old opaque section backgrounds */
+-
+-.hero,
+-.about-section,
+-.events-section,
+-.community-section,
+-.contact-section,
+-.footer {
+-  background-color: transparent !important;
+-}
+-
+-/* Subtle separation between sections */
+-
+-.about-section,
+-.events-section,
+-.community-section,
+-.contact-section {
+-  backdrop-filter: none;
+-}
+-
+-/* Glass-like cards */
+-
+-.highlight-card,
+-.event-card {
+-  background-color: rgba(13, 20, 37, 0.72);
+-  border: 1px solid rgba(120, 155, 210, 0.16);
+-  backdrop-filter: blur(12px);
+-  -webkit-backdrop-filter: blur(12px);
+-}
+-
+-/* Keep navigation readable */
+-
+-.navbar {
+-  background-color: rgba(8, 13, 24, 0.72);
+-  backdrop-filter: blur(16px);
+-  -webkit-backdrop-filter: blur(16px);
+-}
+-
+-/* Accessibility */
+-
+-@media (prefers-reduced-motion: reduce) {
+-  html {
+-    scroll-behavior: auto;
+-  }
+-}
+-
+-/* =====================================
+-   BEYOND THE SCREEN — cinematic 3D layer
+-===================================== */
+-
+-.beyond-screen-background {
+-  position: fixed;
+-  top: 0;
+-  left: 0;
+-  width: 100%;
+-  /* lvh (not dvh): the canvas keeps one size while the mobile address bar
+-     slides in and out, so the camera framing never jumps. */
+-  height: 100vh;
+-  height: 100lvh;
+-  z-index: 0;
+-  overflow: hidden;
+-  pointer-events: none;
+-  background: #030504;
+-}
+-
+-.beyond-screen-background canvas {
+-  display: block;
+-  width: 100%;
+-  height: 100%;
+-}
+-
+-/* Soft vignette keeps the page copy readable over the 3D scene */
+-.beyond-screen-background::after {
+-  content: "";
+-  position: absolute;
+-  inset: 0;
+-  pointer-events: none;
+-  background:
+-    linear-gradient(90deg, rgba(3, 5, 4, 0.4) 0%, rgba(3, 5, 4, 0.08) 55%, rgba(3, 5, 4, 0) 100%),
+-    radial-gradient(ellipse at center, transparent 45%, rgba(3, 5, 4, 0.5) 100%);
+-}
+-
+-.site-content {
+-  position: relative;
+-  z-index: 1;
+-}
+-
+-.site-content section {
+-  background: transparent;
+-}
+-
+-/* Extra scroll after the footer: enter the laptop and travel through the
+-   digital world. Drives the second ScrollTrigger timeline. */
+-.beyond-scroll-runway {
+-  position: relative;
+-  width: 100%;
+-  height: 900vh;
+-  pointer-events: none;
+-  background: transparent;
+-}
++@import "./styles/tokens.css";
++@import "./styles/base.css";
++@import "./styles/nav.css";
++@import "./styles/opening.css";
++@import "./styles/sections.css";
++@import "./styles/gallery.css";
+diff --git a/src/app/layout.tsx b/src/app/layout.tsx
+index 2605967..533cf57 100644
+--- a/src/app/layout.tsx
++++ b/src/app/layout.tsx
+@@ -1,29 +1,32 @@
+-
+-import type { Metadata } from "next";
++import type { Metadata, Viewport } from "next";
++import "@fontsource-variable/instrument-sans";
++import "@fontsource-variable/jetbrains-mono";
++import "@fontsource/instrument-serif/400.css";
++import "@fontsource/instrument-serif/400-italic.css";
+ import "./globals.css";
+ import BeyondTheScreen from "./components/BeyondTheScreen/BeyondTheScreen";
++import SiteHeader from "./components/SiteHeader";
++import SiteEffects from "./components/SiteEffects";
+ 
+ export const metadata: Metadata = {
+   title: "IEI × ISTE NITTE | Engineering the Future",
+-  description:
+-    "The official digital platform of IEI × ISTE NITTE.",
++  description: "The official digital platform of IEI × ISTE NITTE.",
++};
++
++export const viewport: Viewport = {
++  themeColor: "#0a0b0a",
+ };
+ 
+-export default function RootLayout({
+-  children,
+-}: Readonly<{
+-  children: React.ReactNode;
+-}>) {
++export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
+   return (
+     <html lang="en">
+       <body>
+         <BeyondTheScreen />
+-        <div className="site-content">
+-          {children}
+-        </div>
++        <SiteHeader />
++        <SiteEffects />
++        <div className="grain" aria-hidden="true" />
++        <main className="site-content">{children}</main>
+       </body>
+     </html>
+   );
+ }
+-
+-
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index 3adb8ec..dc00f2e 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -1,299 +1,23 @@
+-
+-import MobileNav from "./components/MobileNav";
+-import {
+-  ArrowDown,
+-  ArrowRight,
+-  ArrowUpRight,
+-  Code2,
+-  Cpu,
+-  Lightbulb,
+-  Rocket,
+-  Users,
+-} from "lucide-react";
+-
+-const highlights = [
+-  {
+-    icon: Code2,
+-    title: "Technical Excellence",
+-    description:
+-      "Learn, experiment and develop skills beyond the classroom.",
+-  },
+-  {
+-    icon: Lightbulb,
+-    title: "Innovation & Ideas",
+-    description:
+-      "Turn creative ideas into meaningful projects and solutions.",
+-  },
+-  {
+-    icon: Users,
+-    title: "Community & Collaboration",
+-    description:
+-      "Connect with curious minds and build something together.",
+-  },
+-];
+-
+-const events = [
+-  {
+-    number: "01",
+-    category: "WORKSHOP",
+-    title: "Technical Workshops",
+-    description: "Hands-on learning through practical technical sessions.",
+-    color: "blue",
+-  },
+-  {
+-    number: "02",
+-    category: "COMPETITION",
+-    title: "Hackathons & Challenges",
+-    description: "Build, compete and bring innovative ideas to life.",
+-    color: "purple",
+-  },
+-  {
+-    number: "03",
+-    category: "COMMUNITY",
+-    title: "Talks & Seminars",
+-    description: "Learn from experts, innovators and fellow students.",
+-    color: "cyan",
+-  },
+-];
++import Opening from "./components/Opening";
++import About from "./components/sections/About";
++import Events from "./components/sections/Events";
++import Team from "./components/sections/Team";
++import Gallery from "./components/sections/Gallery";
++import Contact from "./components/sections/Contact";
++import Footer from "./components/sections/Footer";
+ 
+ export default function Home() {
+   return (
+-    <main>
+-      {/* NAVIGATION */}
+-      <header className="navbar">
+-        <a href="#" className="brand">
+-          <span className="brand-mark">IEI</span>
+-          <span className="brand-cross">×</span>
+-          <span className="brand-mark">ISTE</span>
+-          <span className="brand-divider" />
+-          <span className="brand-campus">NITTE</span>
+-        </a>
+-
+-        <nav className="nav-links">
+-          <a href="#home" className="active">Home</a>
+-          <a href="#about">About</a>
+-          <a href="#events">Events</a>
+-          <a href="#team">Our Team</a>
+-          <a href="#contact">Contact</a>
+-        </nav>
+-
+-        <a href="#events" className="nav-cta">
+-          Explore events <ArrowUpRight size={15} />
+-        </a>
+-
+-        <MobileNav />
+-      </header>
+-
+-      {/* HERO */}
+-      <section className="hero" id="home">
+-        <div className="hero-content">
+-          <div className="eyebrow">
+-            <span className="live-dot" />
+-            NITTE STUDENT TECHNICAL COMMUNITY
+-          </div>
+-
+-          <h1>
+-            THINK.
+-            <br />
+-            <span className="gradient-text">CREATE.</span>
+-            <br />
+-            <span className="outline-text">INNOVATE.</span>
+-          </h1>
+-
+-          <p className="hero-description">
+-            A community of engineers, innovators and creators.
+-            Exploring technology, sharing ideas and building
+-            what comes next.
+-          </p>
+-
+-          <div className="hero-actions">
+-            <a href="#events" className="button-primary">
+-              Explore our events <ArrowUpRight size={18} />
+-            </a>
+-            <a href="#about" className="button-secondary">
+-              Discover our community <ArrowRight size={17} />
+-            </a>
+-          </div>
+-
+-          <div className="hero-bottom">
+-            <div className="scroll-indicator">
+-              <ArrowDown size={15} />
+-              <span>SCROLL TO EXPLORE</span>
+-            </div>
+-            <span className="hero-location">
+-              NMAM INSTITUTE OF TECHNOLOGY · NITTE
+-            </span>
+-          </div>
+-        </div>
+-
+-        <div className="hero-side-label">ENGINEERING THE FUTURE</div>
+-      </section>
+-
+-      {/* ABOUT */}
+-      <section className="section about-section" id="about">
+-        <div className="section-heading">
+-          <span className="section-label">01 / WHO WE ARE</span>
+-          <h2>
+-            More than a club.
+-            <br />
+-            <span className="gradient-text">A community of builders.</span>
+-          </h2>
+-        </div>
+-
+-        <div className="about-content">
+-          <p className="about-lead">
+-            IEI × ISTE NITTE brings together students who
+-            are passionate about engineering, technology
+-            and innovation.
+-          </p>
+-          <p className="about-description">
+-            From technical workshops and competitions to
+-            collaborative projects and knowledge-sharing
+-            sessions, we create opportunities to learn,
+-            experiment and grow together.
+-          </p>
+-        </div>
+-
+-        <div className="highlight-grid">
+-          {highlights.map((item) => {
+-            const Icon = item.icon;
+-
+-            return (
+-              <article className="highlight-card" key={item.title}>
+-                <div className="highlight-icon">
+-                  <Icon size={23} />
+-                </div>
+-                <h3>{item.title}</h3>
+-                <p>{item.description}</p>
+-                <ArrowUpRight className="card-arrow" size={19} />
+-              </article>
+-            );
+-          })}
+-        </div>
+-      </section>
+-
+-      {/* EVENTS */}
+-      <section className="section events-section" id="events">
+-        <div className="section-topline">
+-          <span className="section-label">02 / WHAT WE DO</span>
+-          <span className="section-label">LEARN · BUILD · COMPETE</span>
+-        </div>
+-
+-        <div className="events-heading">
+-          <div>
+-            <h2>
+-              Experiences that
+-              <br />
+-              <span className="gradient-text">move you forward.</span>
+-            </h2>
+-            <p>
+-              Discover opportunities to explore your interests
+-              and challenge yourself.
+-            </p>
+-          </div>
+-
+-          <a href="#contact" className="text-link">
+-            Get involved <ArrowUpRight size={17} />
+-          </a>
+-        </div>
+-
+-        <div className="event-grid">
+-          {events.map((event) => (
+-            <article
+-              className={`event-card ${event.color}`}
+-              key={event.number}
+-            >
+-              <div className="event-card-top">
+-                <span>{event.category}</span>
+-                <span>{event.number}</span>
+-              </div>
+-
+-              <div className="event-art">
+-                {event.number === "01" && <Code2 size={62} />}
+-                {event.number === "02" && <Rocket size={62} />}
+-                {event.number === "03" && <Lightbulb size={62} />}
+-              </div>
+-
+-              <div>
+-                <h3>{event.title}</h3>
+-                <p>{event.description}</p>
+-              </div>
+-
+-              <ArrowUpRight className="event-arrow" size={21} />
+-            </article>
+-          ))}
+-        </div>
+-
+-        <p className="events-note">
+-          EVENT LISTINGS AND REGISTRATIONS WILL BE AVAILABLE HERE.
+-        </p>
+-      </section>
+-
+-      {/* COMMUNITY */}
+-      <section className="community-section" id="team">
+-        <div className="community-glow" />
+-        <div className="community-content">
+-          <span className="section-label">03 / THE PEOPLE BEHIND IT</span>
+-          <div className="community-icon">
+-            <Cpu size={34} />
+-          </div>
+-          <h2>
+-            Great ideas.
+-            <br />
+-            <span className="gradient-text">Better together.</span>
+-          </h2>
+-          <p>
+-            Meet the people who make our community happen.
+-            A team of students working together to create,
+-            organize and inspire.
+-          </p>
+-          <a href="#contact" className="button-primary">
+-            Meet the community <ArrowUpRight size={18} />
+-          </a>
+-          <div className="team-placeholder">
+-            CORE TEAM PHOTOGRAPHS & PROFILES COMING SOON
+-          </div>
+-        </div>
+-      </section>
+-
+-      {/* CONTACT */}
+-      <section className="section contact-section" id="contact">
+-        <span className="section-label">04 / GET CONNECTED</span>
+-        <h2>
+-          Your next idea
+-          <br />
+-          <span className="gradient-text">starts here.</span>
+-        </h2>
+-        <p>
+-          Interested in technology, innovation and being
+-          part of something bigger? Stay connected with us.
+-        </p>
+-        <a href="mailto:contact@iei-iste-nitte.example" className="button-primary">
+-          Get in touch <ArrowUpRight size={18} />
+-        </a>
+-      </section>
+-
+-      {/* FOOTER */}
+-      <footer className="footer">
+-        <a href="#home" className="brand footer-brand">
+-          <span className="brand-mark">IEI</span>
+-          <span className="brand-cross">×</span>
+-          <span className="brand-mark">ISTE</span>
+-        </a>
+-
+-        <p>Engineering minds. Connecting ideas. Building tomorrow.</p>
+-
+-        <span className="footer-copy">
+-          © 2026 IEI × ISTE NITTE. All rights reserved.
+-        </span>
+-      </footer>
+-
+-      {/* Extra scroll distance: the camera enters the laptop and travels through the digital world */}
+-      <section
+-        id="beyond-scroll-runway"
+-        className="beyond-scroll-runway"
+-        aria-label="Enter the digital world"
+-      />
+-    </main>
++    <>
++      <Opening />
++      <div className="curtain">
++        <About />
++        <Events />
++        <Team />
++        <Gallery />
++        <Contact />
++        <Footer />
++      </div>
++    </>
+   );
+ }
+diff --git a/src/app/styles/base.css b/src/app/styles/base.css
+new file mode 100644
+index 0000000..d09cf99
+--- /dev/null
++++ b/src/app/styles/base.css
+@@ -0,0 +1,114 @@
++html { scroll-behavior: smooth; background: var(--bg); }
++@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
++html.nav-open { overflow: hidden; }
++
++body {
++  margin: 0;
++  background: var(--bg);
++  color: var(--ink);
++  font-family: var(--f-body);
++  font-size: 17px;
++  line-height: 1.6;
++  -webkit-font-smoothing: antialiased;
++  overflow-x: clip;
++}
++::selection { background: var(--em); color: #04120c; }
++a { color: inherit; text-decoration: none; }
++:focus-visible { outline: 1px solid var(--em); outline-offset: 4px; }
++
++/* ---- WebGL layer ---- */
++.beyond-screen-background {
++  position: fixed; top: 0; left: 0; width: 100%;
++  height: 100vh; height: 100lvh;
++  z-index: 0; overflow: hidden; pointer-events: none; background: #030504;
++}
++.beyond-screen-background canvas { display: block; width: 100%; height: 100%; }
++.beyond-screen-background::after {
++  content: ""; position: absolute; inset: 0; pointer-events: none;
++  background:
++    linear-gradient(90deg, rgba(3,5,4,.4) 0%, rgba(3,5,4,.08) 55%, rgba(3,5,4,0) 100%),
++    radial-gradient(ellipse at center, transparent 45%, rgba(3,5,4,.5) 100%);
++}
++.site-content { position: relative; z-index: 2; }
++
++/* ---- film grain ---- */
++.grain {
++  position: fixed; inset: -50%; z-index: 60; pointer-events: none; opacity: .07;
++  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 .8 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
++  animation: grain 1.2s steps(6) infinite;
++}
++@keyframes grain {
++  0% { transform: translate(0,0); } 20% { transform: translate(-3%,2%); }
++  40% { transform: translate(2%,-3%); } 60% { transform: translate(-2%,-1%); }
++  80% { transform: translate(3%,3%); } 100% { transform: translate(0,0); }
++}
++@media (prefers-reduced-motion: reduce) { .grain { animation: none; } }
++
++/* ---- shared type + parts ---- */
++.wrap { width: 100%; max-width: var(--max); margin: 0 auto; padding: 0 var(--gutter); }
++.wrap--wide { max-width: 1560px; }
++.eyebrow, .sec-head, .member__idx, .member__society, .event__cat, .event__meta dt,
++.about__meta dt, .hud, .hero__scroll, .hero__side, .events__note, .team__note,
++.directory__caption, .shot figcaption, .footer__bar, .frame__label, .lightbox__bar {
++  font-family: var(--f-mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
++}
++.eyebrow { color: var(--ink-2); margin: 0; }
++
++.display {
++  font-family: var(--f-display); font-weight: 400; margin: 0;
++  font-size: clamp(46px, 8.4vw, 132px); line-height: .96; letter-spacing: -.02em;
++}
++.display .line { display: block; }
++.display .line--dim { color: var(--ink-3); }
++.display em { font-style: italic; }
++
++.wordmark { display: inline-flex; align-items: baseline; gap: .4em; font-family: var(--f-mono); font-size: 13px; letter-spacing: .16em; font-weight: 600; }
++.wordmark i { font-style: normal; color: var(--em); }
++.wordmark small { margin-left: .8em; padding-left: 1em; border-left: 1px solid var(--line-2); font-weight: 400; color: var(--ink-3); font-size: 10px; }
++
++.btn {
++  display: inline-flex; align-items: center; gap: .7em; padding: 15px 24px;
++  font-family: var(--f-mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase;
++  border: 1px solid var(--line-2); transition: background .3s var(--ease), color .3s var(--ease), border-color .3s;
++}
++.btn--solid { background: var(--ink); color: #0a0b0a; border-color: var(--ink); }
++.btn--solid:hover { background: var(--em); border-color: var(--em); }
++.btn--line:hover { border-color: var(--em); color: var(--em); }
++
++.link-arrow { font-family: var(--f-mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; border-bottom: 1px solid var(--em-dim); padding-bottom: 4px; transition: border-color .3s, color .3s; }
++.link-arrow:hover { color: var(--em); border-color: var(--em); }
++
++.pulse { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--em); margin-right: 8px; animation: pulse 2s ease-in-out infinite; vertical-align: middle; }
++@keyframes pulse { 50% { opacity: .25; } }
++@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
++
++.sec-head { display: flex; gap: 20px; align-items: center; padding-bottom: 18px; border-bottom: 1px solid var(--line); margin-bottom: clamp(36px, 7vh, 80px); color: var(--ink-2); }
++.sec-head__idx { color: var(--em); }
++.sec-head__meta { margin-left: auto; color: var(--ink-3); }
++
++/* ---- Frame (image / placeholder) ---- */
++.frame { position: relative; width: 100%; overflow: hidden; background: #101312; }
++.frame__img { object-fit: cover; filter: saturate(.8) contrast(1.05) brightness(.9); }
++.frame--empty {
++  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
++  color: var(--ink-3); text-align: center; border: 1px solid var(--line);
++  background:
++    repeating-linear-gradient(135deg, rgba(236,233,226,.025) 0 1px, transparent 1px 14px),
++    radial-gradient(ellipse at 30% 20%, rgba(63,174,131,.08), transparent 60%), #0e100f;
++}
++.frame--empty small { font-family: var(--f-mono); font-size: 10px; letter-spacing: .1em; opacity: .6; text-transform: uppercase; }
++.frame__tick { position: absolute; width: 14px; height: 14px; border: 0 solid var(--line-2); }
++.frame__tick--tl { top: 10px; left: 10px; border-top-width: 1px; border-left-width: 1px; }
++.frame__tick--tr { top: 10px; right: 10px; border-top-width: 1px; border-right-width: 1px; }
++.frame__tick--bl { bottom: 10px; left: 10px; border-bottom-width: 1px; border-left-width: 1px; }
++.frame__tick--br { bottom: 10px; right: 10px; border-bottom-width: 1px; border-right-width: 1px; }
++
++/* ---- reveal (only active once JS marked the page ready) ---- */
++.reveal-ready [data-reveal] { opacity: 0; transform: translateY(26px); transition: opacity .9s var(--ease), transform .9s var(--ease); }
++.reveal-ready [data-reveal].is-in { opacity: 1; transform: none; }
++
++@media (max-width: 640px) { body { font-size: 16px; } .sec-head { gap: 12px; } .sec-head__meta { display: none; } }
++
++.frame__label { display: block; }
++.member__thumb .frame__label, .member__thumb .frame--empty small { display: none; }
++.member__thumb .frame__tick { width: 8px; height: 8px; top: auto; }
+diff --git a/src/app/styles/gallery.css b/src/app/styles/gallery.css
+new file mode 100644
+index 0000000..580add7
+--- /dev/null
++++ b/src/app/styles/gallery.css
+@@ -0,0 +1,27 @@
++.gallery-section { overflow: hidden; }
++.gallery { display: grid; grid-template-columns: repeat(12, 1fr); gap: clamp(28px, 5vh, 64px) clamp(16px, 2vw, 32px); margin-top: clamp(40px, 8vh, 96px); align-items: start; }
++.shot { margin: 0; }
++.shot__open { display: block; width: 100%; padding: 0; background: none; border: 0; cursor: zoom-in; }
++.shot figcaption { display: flex; gap: 14px; justify-content: space-between; padding-top: 10px; color: var(--ink-3); }
++.shot figcaption strong { font-weight: 400; color: var(--ink-2); }
++.shot--1 { grid-column: 1 / 8; }
++.shot--2 { grid-column: 9 / 13; margin-top: 18vh; }
++.shot--3 { grid-column: 2 / 6; }
++.shot--4 { grid-column: 6 / 13; margin-top: 10vh; }
++.shot--5 { grid-column: 1 / 13; }
++.shot--6 { grid-column: 4 / 9; }
++
++.lightbox { padding: 0; border: 0; width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; background: rgba(5,6,5,.96); color: var(--ink); }
++.lightbox::backdrop { background: rgba(0,0,0,.8); }
++.lightbox__inner { display: grid; grid-template-rows: 1fr auto; height: 100%; padding: 24px; gap: 16px; }
++.lightbox__stage { position: relative; }
++.lightbox__stage img { object-fit: contain; }
++.lightbox__bar { display: flex; justify-content: space-between; gap: 16px; align-items: center; color: var(--ink-2); }
++.lightbox__ctrl { display: flex; gap: 8px; }
++.lightbox__ctrl button { font: inherit; letter-spacing: inherit; text-transform: inherit; color: var(--ink); background: none; border: 1px solid var(--line-2); padding: 10px 14px; cursor: pointer; }
++.lightbox__ctrl button:hover { border-color: var(--em); color: var(--em); }
++
++@media (max-width: 900px) {
++  .gallery { display: flex; gap: 14px; overflow-x: auto; scroll-snap-type: x mandatory; margin-inline: calc(var(--gutter) * -1); padding: 0 var(--gutter) 16px; -webkit-overflow-scrolling: touch; }
++  .shot, .shot--2, .shot--4 { flex: 0 0 82vw; margin-top: 0; scroll-snap-align: center; }
++}
+diff --git a/src/app/styles/nav.css b/src/app/styles/nav.css
+new file mode 100644
+index 0000000..5a7de97
+--- /dev/null
++++ b/src/app/styles/nav.css
+@@ -0,0 +1,28 @@
++.nav { position: fixed; inset: 0 0 auto 0; z-index: 50; }
++.nav__bar { display: flex; align-items: center; gap: 32px; height: var(--nav-h); padding: 0 var(--gutter); border-bottom: 1px solid transparent; transition: background .4s, border-color .4s, backdrop-filter .4s; }
++.nav.is-solid .nav__bar, .nav.is-open .nav__bar { background: rgba(10,11,10,.86); backdrop-filter: blur(10px); border-color: var(--line); }
++.nav__links { display: flex; gap: 28px; margin-left: auto; }
++.nav__links a { font-family: var(--f-mono); font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--ink-2); padding: 6px 0; border-bottom: 1px solid transparent; transition: color .25s, border-color .25s; }
++.nav__links a:hover, .nav__links a[aria-current="true"] { color: var(--ink); border-color: var(--em); }
++.nav__cta { font-family: var(--f-mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; padding: 10px 16px; border: 1px solid var(--line-2); transition: border-color .3s, color .3s; }
++.nav__cta:hover { border-color: var(--em); color: var(--em); }
++.burger { display: none; margin-left: auto; width: 44px; height: 44px; background: none; border: 0; position: relative; cursor: pointer; }
++.burger span { position: absolute; left: 10px; right: 10px; height: 1px; background: var(--ink); transition: transform .3s var(--ease), top .3s var(--ease); }
++.burger span:first-child { top: 18px; } .burger span:last-child { top: 26px; }
++.is-open .burger span:first-child { top: 22px; transform: rotate(45deg); }
++.is-open .burger span:last-child { top: 22px; transform: rotate(-45deg); }
++.menu { display: none; }
++
++@media (max-width: 960px) {
++  .nav__links, .nav__cta { display: none; }
++  .burger { display: block; }
++  .menu:not([hidden]) {
++    display: flex; flex-direction: column; justify-content: space-between;
++    position: fixed; inset: var(--nav-h) 0 0 0; padding: 24px var(--gutter) 32px;
++    background: var(--bg); overflow-y: auto;
++  }
++  .menu nav { display: flex; flex-direction: column; }
++  .menu a { display: flex; align-items: baseline; gap: 18px; padding: 18px 0; border-bottom: 1px solid var(--line); font-family: var(--f-display); font-size: 42px; line-height: 1; }
++  .menu a em { font-family: var(--f-mono); font-style: normal; font-size: 11px; color: var(--em); letter-spacing: .12em; }
++  .menu p { font-family: var(--f-mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); }
++}
+diff --git a/src/app/styles/opening.css b/src/app/styles/opening.css
+new file mode 100644
+index 0000000..76186b8
+--- /dev/null
++++ b/src/app/styles/opening.css
+@@ -0,0 +1,42 @@
++.opening { position: relative; z-index: 1; }
++.journey--room .beat, .journey--digital .beat { min-height: 100vh; min-height: 100svh; }
++.journey--digital .beat { min-height: 140vh; }
++.beat { position: relative; display: flex; flex-direction: column; justify-content: center; padding: 0 var(--gutter); }
++.beat--hero { padding-top: var(--nav-h); padding-bottom: 72px; gap: 20px; max-width: 1100px; }
++.hero__title { margin: 0; font-family: var(--f-display); font-weight: 400; font-size: clamp(52px, min(11vw, 15.5vh), 168px); line-height: .9; letter-spacing: -.02em; }
++.hero__title span { display: block; }
++.hero__accent { font-style: italic; color: var(--em); }
++.hero__desc { max-width: 460px; margin: 0; color: var(--ink-2); font-size: clamp(16px, 1.3vw, 19px); }
++.hero__actions { display: flex; flex-wrap: wrap; gap: 12px; }
++.hero__scroll { position: absolute; left: var(--gutter); bottom: 28px; color: var(--ink-3); display: flex; align-items: center; gap: 14px; }
++.hero__scroll i { width: 48px; height: 1px; background: var(--em); display: block; }
++.hero__side { position: absolute; right: var(--gutter); bottom: 28px; color: var(--ink-3); writing-mode: vertical-rl; }
++.cap { margin: 0; max-width: 14em; font-family: var(--f-display); font-style: italic; font-size: clamp(34px, 5.2vw, 84px); line-height: 1.02; letter-spacing: -.01em; text-shadow: 0 2px 30px rgba(0,0,0,.6); }
++.beat--right { align-items: flex-end; text-align: right; }
++.beat--gate { align-items: center; justify-content: flex-end; padding-bottom: 14vh; gap: 20px; text-align: center; }
++.gate__link { font-family: var(--f-display); font-size: clamp(36px, 6vw, 88px); line-height: 1; border-bottom: 1px solid var(--em-dim); padding-bottom: 8px; transition: color .3s, border-color .3s; }
++.gate__link:hover { color: var(--em); border-color: var(--em); }
++
++/* HUD */
++.hud { position: fixed; z-index: 45; left: var(--gutter); right: var(--gutter); bottom: 22px; display: flex; gap: 24px; color: var(--ink-3); pointer-events: none; transition: opacity .4s; }
++.hud span:nth-child(2) { color: var(--ink-2); }
++.hud span:nth-child(n+3) { margin-left: auto; }
++.hud span:nth-child(n+4) { margin-left: 0; }
++.hud__rec { color: var(--em); display: inline-flex; align-items: center; gap: 8px; }
++.hud__rec i { width: 6px; height: 6px; border-radius: 50%; background: var(--em); animation: pulse 1.6s ease-in-out infinite; }
++.hud__skip { position: fixed; z-index: 45; right: var(--gutter); top: calc(var(--nav-h) + 14px); font-family: var(--f-mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); transition: color .3s, opacity .4s; }
++.hud__skip:hover { color: var(--em); }
++.hud.is-hidden, .hud.is-hidden + .hud__skip { opacity: 0; pointer-events: none; }
++.hero__scroll, .hero__side { z-index: 1; }
++
++/* Curtain: content slides over the final gateway frame */
++.curtain { position: relative; z-index: 2; background: var(--bg); border-top: 1px solid var(--em-dim); box-shadow: 0 -60px 80px rgba(0,0,0,.7); }
++
++@media (max-width: 640px) {
++  .hud span:nth-child(3) { display: none; }
++  .hud { bottom: 14px; gap: 14px; }
++  .hero__scroll { bottom: 44px; }
++  .hero__side { display: none; }
++  .hud__skip { top: auto; bottom: 40px; right: var(--gutter); }
++  .beat--right { align-items: flex-start; text-align: left; }
++}
+diff --git a/src/app/styles/sections.css b/src/app/styles/sections.css
+new file mode 100644
+index 0000000..79321d5
+--- /dev/null
++++ b/src/app/styles/sections.css
+@@ -0,0 +1,96 @@
++.section { padding: var(--sec-y) 0; border-bottom: 1px solid var(--line); }
++
++/* About */
++.about__body { display: grid; grid-template-columns: 220px 1fr 1fr; gap: clamp(24px, 4vw, 64px); margin-top: clamp(40px, 8vh, 96px); align-items: start; }
++.about__meta { margin: 0; display: grid; gap: 18px; }
++.about__meta dt { color: var(--ink-3); margin-bottom: 4px; }
++.about__meta dd { margin: 0; font-size: 14px; color: var(--ink-2); }
++.about__lead { margin: 0; font-family: var(--f-display); font-size: clamp(24px, 2.6vw, 38px); line-height: 1.15; }
++.about__desc { margin: 0; color: var(--ink-2); max-width: 44ch; }
++.pillars { list-style: none; margin: clamp(56px, 10vh, 120px) 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, 1fr); border-top: 1px solid var(--line); }
++.pillar { position: relative; padding: 32px 28px 40px 0; border-right: 1px solid var(--line); padding-left: 28px; }
++.pillar:first-child { padding-left: 0; } .pillar:last-child { border-right: 0; }
++.pillar__n { font-family: var(--f-display); font-style: italic; font-size: 20px; color: var(--em); }
++.pillar__t { margin: 28px 0 10px; font-family: var(--f-display); font-weight: 400; font-size: clamp(26px, 2.4vw, 36px); line-height: 1.05; }
++.pillar__d { margin: 0; color: var(--ink-2); font-size: 15px; max-width: 30ch; }
++.pillar__arrow { position: absolute; right: 24px; top: 28px; color: var(--ink-3); transition: color .3s, transform .3s var(--ease); }
++.pillar:hover .pillar__arrow { color: var(--em); transform: translate(3px,-3px); }
++
++/* Events — asymmetric showcases */
++.events__intro { display: grid; grid-template-columns: 1.6fr 1fr; gap: 48px; align-items: end; margin-bottom: clamp(56px, 10vh, 120px); }
++.events__aside { display: grid; gap: 20px; justify-items: start; color: var(--ink-2); max-width: 36ch; }
++.events__aside p { margin: 0; }
++.event-list { display: grid; gap: clamp(72px, 12vh, 150px); }
++.event { display: grid; grid-template-columns: repeat(12, 1fr); gap: 0 clamp(16px, 2vw, 32px); align-items: end; }
++.event__media { grid-column: 1 / 9; grid-row: 1; }
++.event__body { grid-column: 9 / 13; grid-row: 1; display: grid; gap: 14px; justify-items: start; padding-bottom: 8px; position: relative; }
++.event--2 .event__media { grid-column: 6 / 13; }
++.event--2 .event__body { grid-column: 1 / 6; }
++.event--3 .event__media { grid-column: 1 / 13; grid-row: 1; }
++.event--3 .event__body { grid-column: 1 / 8; grid-row: 2; margin-top: 28px; }
++.event__num { font-family: var(--f-display); font-size: clamp(80px, 11vw, 168px); line-height: .8; color: transparent; -webkit-text-stroke: 1px var(--line-2); }
++.event__cat { margin: 0; color: var(--em); }
++.event__title { margin: 0; font-family: var(--f-display); font-weight: 400; font-size: clamp(34px, 3.8vw, 58px); line-height: 1; }
++.event__desc { margin: 0; color: var(--ink-2); max-width: 34ch; }
++.event__meta { margin: 6px 0 10px; padding: 14px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); width: 100%; }
++.event__meta div { display: flex; justify-content: space-between; gap: 16px; }
++.event__meta dt { color: var(--ink-3); } .event__meta dd { margin: 0; font-size: 14px; color: var(--ink-2); }
++.events__note, .team__note { margin: clamp(48px, 8vh, 96px) 0 0; color: var(--ink-3); text-align: center; }
++
++/* Team — directory */
++.team__intro { display: grid; grid-template-columns: 1.6fr 1fr; gap: 48px; align-items: end; margin-bottom: clamp(48px, 8vh, 96px); }
++.team__aside { display: grid; gap: 22px; justify-items: start; color: var(--ink-2); max-width: 38ch; }
++.team__aside p { margin: 0; }
++.directory { display: grid; grid-template-columns: 1.5fr 1fr; gap: clamp(32px, 5vw, 96px); align-items: start; }
++.directory__list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--line); }
++.member { display: grid; grid-template-columns: 48px 1fr auto 0; align-items: center; gap: 16px; width: 100%; padding: 22px 0; text-align: left; background: none; border: 0; border-bottom: 1px solid var(--line); color: var(--ink-3); cursor: pointer; transition: color .3s, padding .4s var(--ease); font: inherit; }
++.member.is-active, .member:hover { color: var(--ink); padding-left: 14px; }
++.member__idx { color: var(--em); }
++.member__main { display: grid; gap: 4px; }
++.member__name { font-family: var(--f-display); font-size: clamp(28px, 3.4vw, 52px); line-height: 1; }
++.member__name.is-placeholder { font-style: italic; }
++.member__role { font-family: var(--f-mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-3); }
++.member__thumb { display: none; }
++.directory__preview { position: sticky; top: calc(var(--nav-h) + 24px); display: grid; gap: 16px; }
++.directory__caption { display: flex; justify-content: space-between; gap: 12px; color: var(--ink-3); }
++.directory__caption strong { font-weight: 400; color: var(--ink); }
++.directory__bio { margin: 0; color: var(--ink-2); font-size: 15px; min-height: 3em; }
++
++/* Contact */
++.contact { padding-bottom: clamp(96px, 16vh, 200px); }
++.contact__title { font-size: clamp(54px, 10.5vw, 168px); }
++.contact__row { display: grid; grid-template-columns: 1fr 1.3fr; gap: 48px; margin-top: clamp(48px, 9vh, 110px); align-items: end; }
++.contact__copy { margin: 0; color: var(--ink-2); max-width: 36ch; }
++.contact__cta { display: grid; grid-template-columns: 1fr auto; align-items: baseline; gap: 6px 24px; padding: 26px 0; border-top: 1px solid var(--line-2); border-bottom: 1px solid var(--line-2); font-family: var(--f-display); font-size: clamp(34px, 5vw, 72px); line-height: 1; transition: color .3s, border-color .3s, padding .4s var(--ease); }
++.contact__cta small { grid-column: 1 / -1; font-family: var(--f-mono); font-size: 11px; letter-spacing: .12em; color: var(--ink-3); }
++.contact__arrow { color: var(--em); transition: transform .4s var(--ease); }
++.contact__cta:hover { color: var(--em); border-color: var(--em); padding-left: 12px; }
++.contact__cta:hover .contact__arrow { transform: translate(6px,-6px); }
++
++/* Footer */
++.footer { padding: 56px 0 28px; }
++.footer__grid { display: grid; grid-template-columns: 1.3fr 1fr 1fr; gap: 40px; padding-bottom: 48px; }
++.footer__brand p { margin: 14px 0 0; color: var(--ink-2); font-size: 15px; max-width: 30ch; }
++.footer__nav { display: grid; gap: 8px; align-content: start; }
++.footer__nav a, .footer__where a { color: var(--ink-2); font-size: 15px; transition: color .25s; }
++.footer__nav a:hover, .footer__where a:hover { color: var(--em); }
++.footer__where { display: grid; gap: 8px; align-content: start; color: var(--ink-3); font-size: 14px; }
++.footer__bar { display: flex; flex-wrap: wrap; gap: 12px 32px; justify-content: space-between; padding-top: 20px; border-top: 1px solid var(--line); color: var(--ink-3); }
++.footer__bar a:hover { color: var(--em); } .footer__end { color: var(--em-dim); }
++
++@media (max-width: 900px) {
++  .about__body { grid-template-columns: 1fr; }
++  .pillars { grid-template-columns: 1fr; }
++  .pillar, .pillar:first-child { padding: 28px 0; border-right: 0; border-bottom: 1px solid var(--line); }
++  .events__intro, .team__intro, .contact__row { grid-template-columns: 1fr; gap: 28px; }
++  .event { display: block; }
++  .event__media { margin-bottom: 20px; }
++  .event__num { font-size: 72px; }
++  .directory { grid-template-columns: 1fr; }
++  .directory__preview { display: none; }
++  .member { grid-template-columns: 36px 1fr 64px; }
++  .member__society { display: none; }
++  .member__thumb { display: block; width: 64px; }
++  .member.is-active, .member:hover { padding-left: 0; }
++  .footer__grid { grid-template-columns: 1fr; gap: 28px; }
++}
+diff --git a/src/app/styles/tokens.css b/src/app/styles/tokens.css
+new file mode 100644
+index 0000000..671d753
+--- /dev/null
++++ b/src/app/styles/tokens.css
+@@ -0,0 +1,22 @@
++/* Design tokens — charcoal, off-white, one restrained emerald. */
++:root {
++  --bg: #0a0b0a;
++  --bg-2: #0e100f;
++  --ink: #ece9e2;
++  --ink-2: rgba(236, 233, 226, 0.66);
++  --ink-3: rgba(236, 233, 226, 0.4);
++  --line: rgba(236, 233, 226, 0.13);
++  --line-2: rgba(236, 233, 226, 0.26);
++  --em: #3fae83;
++  --em-dim: rgba(63, 174, 131, 0.35);
++
++  --f-display: "Instrument Serif", "Times New Roman", serif;
++  --f-body: "Instrument Sans Variable", system-ui, sans-serif;
++  --f-mono: "JetBrains Mono Variable", ui-monospace, monospace;
++
++  --gutter: clamp(20px, 4.5vw, 72px);
++  --max: 1320px;
++  --sec-y: clamp(88px, 14vh, 176px);
++  --ease: cubic-bezier(0.22, 0.7, 0.2, 1);
++  --nav-h: 68px;
++}
+-- 
+2.43.0
+
+
+From 617ae3dedf1fe32a98508ac15813e875fe59e32d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 6 Nov 2026 02:42:30 +0000
+Subject: [PATCH 3/3] Fix footer lint
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GduWwzosU2paBti3qSezKP
+---
+ src/app/components/sections/Footer.tsx | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/app/components/sections/Footer.tsx b/src/app/components/sections/Footer.tsx
+index 449743f..76fd9f6 100644
+--- a/src/app/components/sections/Footer.tsx
++++ b/src/app/components/sections/Footer.tsx
+@@ -32,7 +32,7 @@ export default function Footer() {
+           <span>
+             © {SITE.year} IEI × ISTE NITTE. All rights reserved.
+           </span>
+-          <span className="footer__end">// end of transmission</span>
++          <span className="footer__end">{"// end of transmission"}</span>
+           <a href="#home">Back to start ↑</a>
+         </div>
+       </div>
+-- 
+2.43.0
+

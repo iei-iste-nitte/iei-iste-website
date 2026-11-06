@@ -1,0 +1,3405 @@
+From 9147c6a7578c808046d3332f76f9a8f0eff72d50 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 07:55:08 +0000
+Subject: [PATCH] Rebuild cinematic scroll experience: door, room, laptop
+ portal, digital world
+
+- Fix laptop screen occlusion (chair back sat in front of display)
+- Replace conflicting dual-timeline camera tweens with scoped scroll state
+- Real wall + hinged door; terminal UI; render-target portal into digital scene
+- Long digital journey (900vh runway) ending at a gateway
+- Proper disposal, single GSAP-ticker render loop, Strict Mode safe
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GduWwzosU2paBti3qSezKP
+---
+ .../BeyondTheScreen/BeyondTheScreen.tsx       | 411 ++------
+ src/app/components/BeyondTheScreen/digital.ts | 696 +++++++++++++
+ src/app/components/BeyondTheScreen/room.ts    | 568 +++++++++++
+ src/app/components/BeyondTheScreen/scene.ts   | 933 ++++++------------
+ .../components/BeyondTheScreen/terminal.ts    | 461 +++++++++
+ src/app/components/BeyondTheScreen/util.ts    |  65 ++
+ src/app/globals.css                           |  61 +-
+ src/app/page.tsx                              |  15 +-
+ 8 files changed, 2184 insertions(+), 1026 deletions(-)
+ create mode 100644 src/app/components/BeyondTheScreen/digital.ts
+ create mode 100644 src/app/components/BeyondTheScreen/room.ts
+ create mode 100644 src/app/components/BeyondTheScreen/terminal.ts
+ create mode 100644 src/app/components/BeyondTheScreen/util.ts
+
+diff --git a/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx b/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
+index 23b4c37..be17a76 100644
+--- a/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
++++ b/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
+@@ -1,14 +1,25 @@
+-
+-
+ "use client";
+ 
+ import { useEffect, useRef } from "react";
+ import gsap from "gsap";
+ import { ScrollTrigger } from "gsap/ScrollTrigger";
+-import { createScene } from "./scene";
++import { createScene, DEPTH_MAIN_MAX, DEPTH_PRE_MAX } from "./scene";
+ 
+ gsap.registerPlugin(ScrollTrigger);
+-
++ScrollTrigger.config({ ignoreMobileResize: true });
++
++/**
++ * Fixed full-screen WebGL layer driven by two ScrollTriggers:
++ *
++ *  1. ROOM   - top of page -> start of the runway (the website sections).
++ *              Door swings open, camera walks in towards the laptop.
++ *  2. DIGITAL - the runway (extra scroll after the footer).
++ *              Camera docks on the screen, the terminal dissolves into the
++ *              digital world, then the camera travels deep into it.
++ *
++ * Each timeline writes to its own fields on a shared state object; the render
++ * loop reads that state, so nothing ever fights over the camera.
++ */
+ export default function BeyondTheScreen() {
+   const containerRef = useRef<HTMLDivElement>(null);
+ 
+@@ -16,328 +27,84 @@ export default function BeyondTheScreen() {
+     const container = containerRef.current;
+     if (!container) return;
+ 
+-    const world = createScene(container);
+-    container.appendChild(world.renderer.domElement);
+-
+-    const {
+-      camera,
+-      renderer,
+-      room,
+-      doorPivot,
+-      laptop,
+-      digitalWorld,
+-      terminalPanels,
+-      dataNodes,
+-      resize,
+-      update,
+-      dispose,
+-    } = world;
+-
+-    const cameraTarget = {
+-      x: 0,
+-      y: 1.7,
+-      z: 0,
+-    };
+-
+-    const look = () => {
+-      camera.lookAt(
+-        cameraTarget.x,
+-        cameraTarget.y,
+-        cameraTarget.z
+-      );
+-    };
+-
+-    look();
+-
+-    // =====================================
+-    // PHASE 1: OPEN THE DOOR AND ENTER ROOM
+-    // =====================================
+-
+-    const roomTimeline = gsap.timeline({
+-      scrollTrigger: {
+-        trigger: document.documentElement,
+-        start: "top top",
+-        endTrigger: "#beyond-scroll-runway",
+-        end: "top bottom",
+-        scrub: 1,
+-        invalidateOnRefresh: true,
+-      },
+-    });
+-
+-    roomTimeline
+-      .to(
+-        doorPivot.rotation,
+-        {
+-          y: -Math.PI / 2,
+-          duration: 1.4,
+-          ease: "power2.inOut",
+-        },
+-        0
+-      )
+-      .to(
+-        camera.position,
+-        {
+-          x: 0,
+-          y: 1.9,
+-          z: -1.5,
+-          duration: 2,
+-          ease: "power2.inOut",
+-          onUpdate: look,
+-        },
+-        1
+-      )
+-      .to(
+-        cameraTarget,
+-        {
+-          x: 0,
+-          y: 1.7,
+-          z: -5.5,
+-          duration: 2,
+-          ease: "power2.inOut",
+-          onUpdate: look,
+-        },
+-        1
+-      )
+-      .to(
+-        camera.position,
+-        {
+-          x: 0,
+-          y: 1.8,
+-          z: -4.4,
+-          duration: 2,
+-          ease: "power2.inOut",
+-          onUpdate: look,
+-        },
+-        3
+-      )
+-      .to(
+-        cameraTarget,
+-        {
+-          x: 0,
+-          y: 1.8,
+-          z: -6.9,
+-          duration: 2,
+-          ease: "power2.inOut",
+-          onUpdate: look,
+-        },
+-        3
+-      )
+-      .to(
+-        laptop.rotation,
+-        {
+-          x: -0.035,
+-          duration: 1,
+-          ease: "power1.inOut",
+-        },
+-        3.5
+-      );
+-
+-    // =====================================
+-    // PHASE 2: ENTER THE LAPTOP SCREEN
+-    // =====================================
+-
+-    const digitalTimeline = gsap.timeline({
+-      scrollTrigger: {
+-        trigger: "#beyond-scroll-runway",
+-        start: "top bottom",
+-        end: "bottom bottom",
+-        scrub: 1,
+-        invalidateOnRefresh: true,
+-      },
+-    });
+-
+-    // Reveal the digital world only after the camera
+-    // passes through the laptop screen.
+-    const switchWorld = () => {
+-      const hasEnteredScreen = camera.position.z < -7.15;
+-
+-      room.visible = !hasEnteredScreen;
+-      digitalWorld.visible = hasEnteredScreen;
+-    };
+-
+-    digitalTimeline
+-      .to(
+-        camera.position,
+-        {
+-          x: 0,
+-          y: 1.8,
+-          z: -7.4,
+-          duration: 1.2,
+-          ease: "power2.in",
+-          onUpdate: () => {
+-            look();
+-            switchWorld();
+-          },
+-        },
+-        0
+-      )
+-      .to(
+-        cameraTarget,
+-        {
+-          x: 0,
+-          y: 1.8,
+-          z: -12,
+-          duration: 1.2,
+-          ease: "power2.in",
+-          onUpdate: look,
+-        },
+-        0
+-      )
+-      .to(
+-        camera,
+-        {
+-          fov: 68,
+-          duration: 1.2,
+-          ease: "power2.in",
+-          onUpdate: () => camera.updateProjectionMatrix(),
++    // Strict Mode / HMR safety: never leave a stale canvas behind.
++    container.querySelectorAll("canvas").forEach((c) => c.remove());
++
++    let world: ReturnType<typeof createScene>;
++    try {
++      world = createScene(container);
++    } catch (error) {
++      console.warn("BeyondTheScreen: WebGL unavailable", error);
++      container.dataset.fallback = "true";
++      return;
++    }
++    container.appendChild(world.domElement);
++
++    const runway = document.getElementById("beyond-scroll-runway");
++    const { state } = world;
++
++    const ctx = gsap.context(() => {
++      const scrub = window.matchMedia("(prefers-reduced-motion: reduce)").matches
++        ? 0.2
++        : 0.8;
++
++      // Phase 1-4: door, walk in, approach the laptop (website content scroll)
++      const roomTl = gsap.timeline({
++        defaults: { ease: "none" },
++        scrollTrigger: {
++          trigger: document.documentElement,
++          start: "top top",
++          endTrigger: runway ?? document.body,
++          end: runway ? "top bottom" : "bottom bottom",
++          scrub,
++          invalidateOnRefresh: true,
+         },
+-        0
+-      )
+-      .to(
+-        camera.position,
+-        {
+-          x: 0,
+-          y: 2,
+-          z: -20,
+-          duration: 2.5,
+-          ease: "power2.inOut",
+-          onUpdate: () => {
+-            look();
+-            switchWorld();
+-          },
+-        },
+-        1.2
+-      )
+-      .to(
+-        cameraTarget,
+-        {
+-          x: 0,
+-          y: 2,
+-          z: -32,
+-          duration: 2.5,
+-          ease: "power2.inOut",
+-          onUpdate: look,
+-        },
+-        1.2
+-      )
+-      .to(
+-        camera,
+-        {
+-          fov: 55,
+-          duration: 2,
+-          ease: "power2.out",
+-          onUpdate: () => camera.updateProjectionMatrix(),
+-        },
+-        2
+-      )
+-      .to(
+-        camera.position,
+-        {
+-          z: -29,
+-          duration: 2,
+-          ease: "power2.inOut",
+-          onUpdate: () => {
+-            look();
+-            switchWorld();
+-          },
+-        },
+-        3.7
+-      )
+-      .to(
+-        cameraTarget,
+-        {
+-          z: -45,
+-          duration: 2,
+-          ease: "power2.inOut",
+-          onUpdate: look,
+-        },
+-        3.7
+-      );
+-
+-    // =====================================
+-    // FLOATING TERMINAL PANELS
+-    // =====================================
+-
+-    const floatingTweens: gsap.core.Tween[] = [];
+-
+-    terminalPanels.forEach((panel, index) => {
+-      const tween = gsap.to(panel.position, {
+-        y: panel.position.y + (index % 2 === 0 ? 0.16 : -0.16),
+-        duration: 3 + index * 0.25,
+-        repeat: -1,
+-        yoyo: true,
+-        ease: "sine.inOut",
+       });
+-
+-      floatingTweens.push(tween);
+-    });
+-
+-    // =====================================
+-    // DATA NODES
+-    // =====================================
+-
+-    dataNodes.forEach((node, index) => {
+-      floatingTweens.push(
+-        gsap.to(node.position, {
+-          y: node.position.y + (index % 2 === 0 ? 0.2 : -0.2),
+-          duration: 2 + (index % 4) * 0.3,
+-          repeat: -1,
+-          yoyo: true,
+-          ease: "sine.inOut",
+-        })
+-      );
+-
+-      floatingTweens.push(
+-        gsap.to(node.scale, {
+-          x: 1.4,
+-          y: 1.4,
+-          z: 1.4,
+-          duration: 1.5 + (index % 3) * 0.2,
+-          repeat: -1,
+-          yoyo: true,
+-          ease: "sine.inOut",
+-        })
+-      );
+-    });
+-
+-    // =====================================
+-    // RENDER LOOP
+-    // =====================================
+-
+-    let animationFrame = 0;
+-
+-    const render = () => {
+-      animationFrame = requestAnimationFrame(render);
+-      update();
+-    };
+-
+-    render();
+-
+-    window.addEventListener("resize", resize);
+-
+-    // Wait for layout and refresh scroll calculations.
+-    requestAnimationFrame(() => {
+-      ScrollTrigger.refresh();
+-    });
+-
+-    // =====================================
+-    // CLEANUP
+-    // =====================================
++      roomTl
++        .fromTo(state, { door: 0 }, { door: 1, duration: 1.8, ease: "power2.inOut", immediateRender: false }, 0)
++        .fromTo(state, { walk: 0 }, { walk: 1, duration: 4.2, ease: "power1.inOut", immediateRender: false }, 1.6);
++
++      // Phase 5-6: enter the screen and travel through the digital world
++      if (runway) {
++        const digitalTl = gsap.timeline({
++          defaults: { ease: "none" },
++          scrollTrigger: {
++            trigger: runway,
++            start: "top bottom",
++            end: "bottom bottom",
++            scrub,
++            invalidateOnRefresh: true,
++          },
++        });
++        digitalTl
++          .fromTo(state, { approach: 0 }, { approach: 1, duration: 1.6, ease: "power2.inOut", immediateRender: false }, 0)
++          .fromTo(state, { mix: 0 }, { mix: 1, duration: 1.0, ease: "power1.inOut", immediateRender: false }, 0.9)
++          .fromTo(state, { depthPre: 0 }, { depthPre: DEPTH_PRE_MAX, duration: 1.9, immediateRender: false }, 0)
++          .fromTo(state, { depthMain: 0 }, { depthMain: DEPTH_MAIN_MAX, duration: 8.1, ease: "power1.inOut", immediateRender: false }, 1.9);
++      }
++    }, container);
++
++    // Single render loop, shared with GSAP's ticker (pauses with the tab).
++    const tick = (time: number) => world.render(time);
++    gsap.ticker.add(tick);
++
++    const onResize = () => world.resize();
++    window.addEventListener("resize", onResize);
++
++    const refresh = () => ScrollTrigger.refresh();
++    const raf = requestAnimationFrame(refresh);
++    if (document.readyState !== "complete") {
++      window.addEventListener("load", refresh, { once: true });
++    }
++    document.fonts?.ready.then(refresh).catch(() => undefined);
+ 
+     return () => {
+-      cancelAnimationFrame(animationFrame);
+-      window.removeEventListener("resize", resize);
+-
+-      roomTimeline.scrollTrigger?.kill();
+-      digitalTimeline.scrollTrigger?.kill();
+-
+-      roomTimeline.kill();
+-      digitalTimeline.kill();
+-
+-      floatingTweens.forEach((tween) => tween.kill());
+-
+-      ScrollTrigger.refresh();
+-      dispose();
++      cancelAnimationFrame(raf);
++      window.removeEventListener("load", refresh);
++      window.removeEventListener("resize", onResize);
++      gsap.ticker.remove(tick);
++      ctx.revert();
++      world.dispose();
+     };
+   }, []);
+ 
+diff --git a/src/app/components/BeyondTheScreen/digital.ts b/src/app/components/BeyondTheScreen/digital.ts
+new file mode 100644
+index 0000000..2e0cc2a
+--- /dev/null
++++ b/src/app/components/BeyondTheScreen/digital.ts
+@@ -0,0 +1,696 @@
++import * as THREE from "three";
++import { disposeObject, makeCanvas, mulberry32 } from "./util";
++
++/** Total distance the camera travels inside the digital world. */
++export const DEPTH_MAX = 335;
++
++const TUNNEL_START = 12;
++const TUNNEL_END = -352;
++const GATE_Z = -362;
++
++const PROFILE: [number, number][] = [
++  [-4.4, -3], [4.4, -3], [6, -1.4], [6, 2.6],
++  [4.4, 4.2], [-4.4, 4.2], [-6, 2.6], [-6, -1.4],
++];
++
++const GRID_VERT = /* glsl */ `
++  varying vec3 vWorld;
++  void main() {
++    vec4 w = modelMatrix * vec4(position, 1.0);
++    vWorld = w.xyz;
++    gl_Position = projectionMatrix * viewMatrix * w;
++  }
++`;
++
++const GRID_FRAG = /* glsl */ `
++  uniform vec3 uColor;
++  uniform float uTime;
++  uniform float uOpacity;
++  varying vec3 vWorld;
++  float gridLine(vec2 p, float scale) {
++    vec2 q = p / scale;
++    vec2 g = abs(fract(q - 0.5) - 0.5) / fwidth(q);
++    return 1.0 - min(min(g.x, g.y), 1.0);
++  }
++  void main() {
++    float l1 = gridLine(vWorld.xz, 1.0);
++    float l5 = gridLine(vWorld.xz, 5.0);
++    float d = distance(vWorld, cameraPosition);
++    float fade = exp(-pow(d * 0.0075, 2.0));
++    float pulse = 0.5 + 0.5 * sin(vWorld.z * 0.12 + uTime * 1.5);
++    float a = (l1 * 0.2 + l5 * 0.55) * fade * uOpacity * (0.7 + 0.3 * pulse);
++    gl_FragColor = vec4(uColor, a);
++    #include <colorspace_fragment>
++  }
++`;
++
++const POINT_VERT = /* glsl */ `
++  attribute float aSeed;
++  attribute float aSize;
++  uniform float uTime;
++  uniform float uScale;
++  uniform vec3 uC1;
++  uniform vec3 uC2;
++  varying float vA;
++  varying vec3 vC;
++  void main() {
++    vec3 p = position;
++    p.y += sin(uTime * 0.4 + aSeed * 40.0) * 0.25;
++    p.x += cos(uTime * 0.3 + aSeed * 25.0) * 0.2;
++    vec4 mv = modelViewMatrix * vec4(p, 1.0);
++    float dist = -mv.z;
++    gl_PointSize = clamp(aSize * uScale / max(dist, 0.1), 1.0, 7.0);
++    gl_Position = projectionMatrix * mv;
++    float twinkle = 0.35 + 0.65 * fract(aSeed * 7.0 + uTime * 0.05 * fract(aSeed * 3.0));
++    vA = exp(-pow(dist * 0.0085, 2.0)) * twinkle * smoothstep(0.3, 2.5, dist);
++    vC = mix(uC1, uC2, step(0.7, fract(aSeed * 13.0)));
++  }
++`;
++
++const POINT_FRAG = /* glsl */ `
++  varying float vA;
++  varying vec3 vC;
++  void main() {
++    float d = length(gl_PointCoord - 0.5) * 2.0;
++    float a = smoothstep(1.0, 0.0, d) * vA;
++    gl_FragColor = vec4(vC, a);
++    #include <colorspace_fragment>
++  }
++`;
++
++function glyphTexture(seed: number) {
++  const rand = mulberry32(seed);
++  const { canvas, ctx } = makeCanvas(512, 512);
++  const chars = "0123456789ABCDEF{}<>/=;:+*";
++  const cols = 32;
++  const rows = 18;
++  const cw = 512 / cols;
++  const rh = 512 / rows;
++  ctx.font = `${Math.floor(rh * 0.7)}px ui-monospace, Menlo, Consolas, monospace`;
++  ctx.textAlign = "center";
++  ctx.textBaseline = "middle";
++  for (let c = 0; c < cols; c++) {
++    if (rand() < 0.35) continue;
++    const head = Math.floor(rand() * rows);
++    const len = 4 + Math.floor(rand() * 10);
++    for (let k = 0; k < len; k++) {
++      const r = (head - k + rows) % rows;
++      const ch = chars[Math.floor(rand() * chars.length)];
++      const a = k === 0 ? 0.95 : Math.max(0.08, 0.6 - k * 0.055);
++      ctx.fillStyle =
++        k === 0 ? `rgba(176,226,200,${a})` : `rgba(48,160,120,${a})`;
++      ctx.fillText(ch, c * cw + cw / 2, r * rh + rh / 2);
++    }
++  }
++  const tex = new THREE.CanvasTexture(canvas);
++  tex.colorSpace = THREE.SRGBColorSpace;
++  tex.wrapS = THREE.RepeatWrapping;
++  tex.wrapT = THREE.RepeatWrapping;
++  tex.anisotropy = 4;
++  return tex;
++}
++
++function hudTexture(kind: number) {
++  const rand = mulberry32(900 + kind * 31);
++  const { canvas, ctx } = makeCanvas(512, 320);
++  const mono = "ui-monospace, Menlo, Consolas, monospace";
++  const titles = [
++    "NODE MAP", "PACKET FLOW", "AUTH LOG", "THROUGHPUT",
++    "HEX DUMP", "ENCRYPTION", "TOPOLOGY", "PROCESSES",
++  ];
++
++  ctx.fillStyle = "rgba(2,10,7,0.9)";
++  ctx.fillRect(0, 0, 512, 320);
++  ctx.strokeStyle = "#1d5a43";
++  ctx.lineWidth = 2;
++  ctx.strokeRect(1, 1, 510, 318);
++  ctx.fillStyle = "#0a1d15";
++  ctx.fillRect(2, 2, 508, 34);
++  ctx.fillStyle = "#a9d6bd";
++  ctx.font = `bold 18px ${mono}`;
++  ctx.fillText(titles[kind % 8], 16, 26);
++  ctx.fillStyle = "#4fae80";
++  ctx.beginPath();
++  ctx.arc(488, 19, 5, 0, Math.PI * 2);
++  ctx.fill();
++
++  const green = "#4fae80";
++  const teal = "#3d9e98";
++  const dim = "#3f6b57";
++  ctx.lineWidth = 1.5;
++
++  switch (kind % 8) {
++    case 0: {
++      const pts = Array.from({ length: 16 }, () => [
++        30 + rand() * 450,
++        56 + rand() * 240,
++      ]);
++      ctx.strokeStyle = "rgba(61,158,152,0.5)";
++      pts.forEach((p, i) => {
++        const q = pts[(i * 5 + 3) % pts.length];
++        ctx.beginPath();
++        ctx.moveTo(p[0], p[1]);
++        ctx.lineTo(q[0], q[1]);
++        ctx.stroke();
++      });
++      pts.forEach((p) => {
++        ctx.fillStyle = green;
++        ctx.fillRect(p[0] - 4, p[1] - 4, 8, 8);
++      });
++      break;
++    }
++    case 1: {
++      for (let i = 0; i < 28; i++) {
++        const h = 20 + rand() * 200;
++        ctx.fillStyle = i % 6 === 0 ? teal : green;
++        ctx.fillRect(22 + i * 17, 300 - h, 11, h);
++      }
++      break;
++    }
++    case 2: {
++      ctx.font = `15px ${mono}`;
++      const lines = ["token accepted", "session 0x4F2A open", "scope=root", "mfa ok", "key exchange done", "policy: allow", "audit logged", "ratelimit 0/s", "ip 10.8.0.14"];
++      lines.forEach((l, i) => {
++        ctx.fillStyle = i % 4 === 3 ? "#a8956a" : green;
++        ctx.fillText(`[${String(i * 3 + 11).padStart(2, "0")}:2${i}] ${l}`, 18, 66 + i * 27);
++      });
++      break;
++    }
++    case 3: {
++      for (let s = 0; s < 3; s++) {
++        ctx.strokeStyle = [green, teal, "#a9d6bd"][s];
++        ctx.beginPath();
++        for (let i = 0; i < 60; i++) {
++          const y = 190 + Math.sin(i * 0.25 + s * 2 + kind) * (40 + s * 10) + (rand() - 0.5) * 18 - s * 20;
++          if (i === 0) ctx.moveTo(18, y);
++          else ctx.lineTo(18 + i * 8.2, y);
++        }
++        ctx.stroke();
++      }
++      break;
++    }
++    case 4: {
++      ctx.font = `14px ${mono}`;
++      for (let r = 0; r < 9; r++) {
++        let row = (0x4f00 + r * 16).toString(16).padStart(4, "0") + "  ";
++        for (let c = 0; c < 12; c++) {
++          row += Math.floor(rand() * 256).toString(16).padStart(2, "0") + " ";
++        }
++        ctx.fillStyle = r % 3 === 0 ? "#a9d6bd" : green;
++        ctx.fillText(row, 14, 62 + r * 27);
++      }
++      break;
++    }
++    case 5: {
++      ctx.strokeStyle = teal;
++      ctx.lineWidth = 10;
++      ctx.beginPath();
++      ctx.arc(130, 180, 70, 0, Math.PI * 2);
++      ctx.stroke();
++      ctx.strokeStyle = green;
++      ctx.beginPath();
++      ctx.arc(130, 180, 70, -Math.PI / 2, Math.PI * 0.9);
++      ctx.stroke();
++      ctx.lineWidth = 1.5;
++      ctx.fillStyle = "#a9d6bd";
++      ctx.font = `bold 22px ${mono}`;
++      ctx.fillText("AES-256", 250, 120);
++      ctx.fillStyle = dim;
++      ctx.font = `15px ${mono}`;
++      ["GCM  active", "RSA-4096  ok", "SHA-512  ok", "TLS 1.3"].forEach((l, i) => ctx.fillText(l, 250, 156 + i * 28));
++      break;
++    }
++    case 6: {
++      ctx.strokeStyle = "rgba(61,158,152,0.6)";
++      const root = [256, 70];
++      for (let i = 0; i < 4; i++) {
++        const a = [60 + i * 130, 170];
++        ctx.beginPath();
++        ctx.moveTo(root[0], root[1]);
++        ctx.lineTo(a[0], a[1]);
++        ctx.stroke();
++        for (let j = 0; j < 2; j++) {
++          const b = [a[0] - 30 + j * 60, 270];
++          ctx.beginPath();
++          ctx.moveTo(a[0], a[1]);
++          ctx.lineTo(b[0], b[1]);
++          ctx.stroke();
++          ctx.fillStyle = green;
++          ctx.fillRect(b[0] - 5, b[1] - 5, 10, 10);
++        }
++        ctx.fillStyle = teal;
++        ctx.fillRect(a[0] - 6, a[1] - 6, 12, 12);
++      }
++      ctx.fillStyle = "#a9d6bd";
++      ctx.fillRect(root[0] - 8, root[1] - 8, 16, 16);
++      break;
++    }
++    default: {
++      ctx.font = `14px ${mono}`;
++      ["gatewayd", "tls-proxy", "ids-engine", "sync-agent", "key-vault", "logshipper"].forEach((n, i) => {
++        ctx.fillStyle = "#a9d6bd";
++        ctx.fillText(n, 18, 66 + i * 38);
++        ctx.fillStyle = "#0b1d15";
++        ctx.fillRect(190, 52 + i * 38, 300, 12);
++        ctx.fillStyle = i === 2 ? "#a8956a" : green;
++        ctx.fillRect(190, 52 + i * 38, 40 + rand() * 240, 12);
++      });
++    }
++  }
++
++  const tex = new THREE.CanvasTexture(canvas);
++  tex.colorSpace = THREE.SRGBColorSpace;
++  tex.anisotropy = 4;
++  return tex;
++}
++
++function gateTextTexture() {
++  const { canvas, ctx } = makeCanvas(1024, 256);
++  ctx.textAlign = "center";
++  ctx.shadowColor = "rgba(79,174,128,0.8)";
++  ctx.shadowBlur = 24;
++  ctx.fillStyle = "#b5e3cb";
++  ctx.font = "bold 120px ui-monospace, Menlo, Consolas, monospace";
++  ctx.fillText("IEI × ISTE", 512, 130);
++  ctx.shadowBlur = 0;
++  ctx.fillStyle = "#4f8a70";
++  ctx.font = "28px ui-monospace, Menlo, Consolas, monospace";
++  ctx.fillText("NMAM INSTITUTE OF TECHNOLOGY  ·  NITTE", 512, 196);
++  const tex = new THREE.CanvasTexture(canvas);
++  tex.colorSpace = THREE.SRGBColorSpace;
++  tex.anisotropy = 4;
++  return tex;
++}
++
++function dotTexture() {
++  const { canvas, ctx } = makeCanvas(64, 64);
++  const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
++  g.addColorStop(0, "rgba(255,255,255,1)");
++  g.addColorStop(0.35, "rgba(255,255,255,0.8)");
++  g.addColorStop(1, "rgba(255,255,255,0)");
++  ctx.fillStyle = g;
++  ctx.fillRect(0, 0, 64, 64);
++  const tex = new THREE.CanvasTexture(canvas);
++  tex.colorSpace = THREE.SRGBColorSpace;
++  return tex;
++}
++
++function glowTexture() {
++  const { canvas, ctx } = makeCanvas(256, 256);
++  const g = ctx.createRadialGradient(128, 128, 0, 128, 128, 128);
++  g.addColorStop(0, "rgba(160,230,195,0.9)");
++  g.addColorStop(0.25, "rgba(60,160,120,0.35)");
++  g.addColorStop(1, "rgba(0,0,0,0)");
++  ctx.fillStyle = g;
++  ctx.fillRect(0, 0, 256, 256);
++  const tex = new THREE.CanvasTexture(canvas);
++  tex.colorSpace = THREE.SRGBColorSpace;
++  return tex;
++}
++
++export function createDigitalWorld() {
++  const rand = mulberry32(2026);
++  const scene = new THREE.Scene();
++  scene.background = new THREE.Color("#010504");
++  scene.fog = new THREE.FogExp2("#010504", 0.0055);
++
++  const lineBase = { transparent: true, toneMapped: false } as const;
++
++  // ---------- Tunnel frames ----------
++  const minor: number[] = [];
++  const major: number[] = [];
++  let ringIndex = 0;
++  for (let z = TUNNEL_START; z >= TUNNEL_END; z -= 6) {
++    const target = ringIndex % 5 === 0 ? major : minor;
++    for (let k = 0; k < PROFILE.length; k++) {
++      const a = PROFILE[k];
++      const b = PROFILE[(k + 1) % PROFILE.length];
++      target.push(a[0], a[1], z, b[0], b[1], z);
++    }
++    ringIndex++;
++  }
++  const longitudinal: number[] = [];
++  PROFILE.forEach((p) => longitudinal.push(p[0], p[1], TUNNEL_START, p[0], p[1], TUNNEL_END));
++
++  const makeLines = (verts: number[], color: string, opacity: number) => {
++    const geo = new THREE.BufferGeometry();
++    geo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
++    const mat = new THREE.LineBasicMaterial({
++      color,
++      opacity,
++      blending: THREE.AdditiveBlending,
++      depthWrite: false,
++      ...lineBase,
++    });
++    const lines = new THREE.LineSegments(geo, mat);
++    scene.add(lines);
++    return lines;
++  };
++  makeLines(minor, "#176b50", 0.5);
++  makeLines(major, "#2f9f80", 0.8);
++  makeLines(longitudinal, "#1f7d63", 0.55);
++
++  // ---------- Grid floor and ceiling ----------
++  const gridUniforms: THREE.ShaderMaterial[] = [];
++  const makeGrid = (y: number, color: string, opacity: number) => {
++    const mat = new THREE.ShaderMaterial({
++      vertexShader: GRID_VERT,
++      fragmentShader: GRID_FRAG,
++      transparent: true,
++      depthWrite: false,
++      blending: THREE.AdditiveBlending,
++      side: THREE.DoubleSide,
++      toneMapped: false,
++      uniforms: {
++        uColor: { value: new THREE.Color(color) },
++        uTime: { value: 0 },
++        uOpacity: { value: opacity },
++      },
++    });
++    const mesh = new THREE.Mesh(new THREE.PlaneGeometry(12, 400), mat);
++    mesh.rotation.x = -Math.PI / 2;
++    mesh.position.set(0, y, (TUNNEL_START + TUNNEL_END) / 2);
++    scene.add(mesh);
++    gridUniforms.push(mat);
++  };
++  makeGrid(-3, "#2f9f80", 1);
++  makeGrid(4.2, "#1f7d63", 0.45);
++
++  // ---------- Code stream walls ----------
++  const glyphA = glyphTexture(11);
++  const glyphB = glyphTexture(47);
++  const glyphGeo = new THREE.PlaneGeometry(7, 3.6);
++  const makeGlyphMat = (map: THREE.Texture) =>
++    new THREE.MeshBasicMaterial({
++      map,
++      transparent: true,
++      opacity: 0.5,
++      blending: THREE.AdditiveBlending,
++      depthWrite: false,
++      toneMapped: false,
++    });
++  const glyphMats = [makeGlyphMat(glyphA), makeGlyphMat(glyphB)];
++  for (let i = 0; i < 12; i++) {
++    [-1, 1].forEach((side, s) => {
++      const m = new THREE.Mesh(glyphGeo, glyphMats[(i + s) % 2]);
++      m.position.set(side * 5.93, 0.6, -14 - i * 29 - (s ? 14 : 0));
++      m.rotation.y = side < 0 ? Math.PI / 2 : -Math.PI / 2;
++      scene.add(m);
++    });
++  }
++
++  // ---------- Data particles ----------
++  const PARTICLES = 3600;
++  const pPos = new Float32Array(PARTICLES * 3);
++  const pSeed = new Float32Array(PARTICLES);
++  const pSize = new Float32Array(PARTICLES);
++  for (let i = 0; i < PARTICLES; i++) {
++    pPos[i * 3] = (rand() - 0.5) * 11;
++    pPos[i * 3 + 1] = -2.8 + rand() * 6.8;
++    pPos[i * 3 + 2] = 8 - rand() * 400;
++    pSeed[i] = rand();
++    pSize[i] = 0.7 + rand() * 1.6;
++  }
++  const pGeo = new THREE.BufferGeometry();
++  pGeo.setAttribute("position", new THREE.BufferAttribute(pPos, 3));
++  pGeo.setAttribute("aSeed", new THREE.BufferAttribute(pSeed, 1));
++  pGeo.setAttribute("aSize", new THREE.BufferAttribute(pSize, 1));
++  const particleMat = new THREE.ShaderMaterial({
++    vertexShader: POINT_VERT,
++    fragmentShader: POINT_FRAG,
++    transparent: true,
++    depthWrite: false,
++    blending: THREE.AdditiveBlending,
++    toneMapped: false,
++    uniforms: {
++      uTime: { value: 0 },
++      uScale: { value: 500 },
++      uC1: { value: new THREE.Color("#4fae80") },
++      uC2: { value: new THREE.Color("#7fd0c8") },
++    },
++  });
++  const particles = new THREE.Points(pGeo, particleMat);
++  particles.frustumCulled = false;
++  scene.add(particles);
++
++  // ---------- Network graph ----------
++  const NODE_COUNT = 72;
++  const nodes: THREE.Vector3[] = [];
++  for (let i = 0; i < NODE_COUNT; i++) {
++    nodes.push(
++      new THREE.Vector3(
++        (rand() - 0.5) * 9.4,
++        -2.2 + rand() * 5.6,
++        -24 - rand() * (DEPTH_MAX + 20)
++      )
++    );
++  }
++  const edgeSet = new Set<string>();
++  const edges: [number, number][] = [];
++  nodes.forEach((n, i) => {
++    nodes
++      .map((m, j) => ({ j, d: n.distanceTo(m) }))
++      .filter((o) => o.j !== i && o.d < 48)
++      .sort((a, b) => a.d - b.d)
++      .slice(0, 2)
++      .forEach(({ j }) => {
++        const key = i < j ? `${i}-${j}` : `${j}-${i}`;
++        if (!edgeSet.has(key)) {
++          edgeSet.add(key);
++          edges.push([i, j]);
++        }
++      });
++  });
++  const edgeVerts: number[] = [];
++  edges.forEach(([a, b]) =>
++    edgeVerts.push(nodes[a].x, nodes[a].y, nodes[a].z, nodes[b].x, nodes[b].y, nodes[b].z)
++  );
++  makeLines(edgeVerts, "#2a8c8a", 0.28);
++
++  const dot = dotTexture();
++  const nodeGeo = new THREE.BufferGeometry().setFromPoints(nodes);
++  scene.add(
++    new THREE.Points(
++      nodeGeo,
++      new THREE.PointsMaterial({
++        color: "#9fd6bd",
++        map: dot,
++        size: 4,
++        sizeAttenuation: false,
++        transparent: true,
++        opacity: 0.6,
++        blending: THREE.AdditiveBlending,
++        depthWrite: false,
++        toneMapped: false,
++      })
++    )
++  );
++
++  const PULSES = 56;
++  const pulseState = Array.from({ length: PULSES }, () => ({
++    edge: Math.floor(rand() * edges.length),
++    t: rand(),
++    speed: 0.08 + rand() * 0.18,
++  }));
++  const pulsePos = new Float32Array(PULSES * 3);
++  const pulseGeo = new THREE.BufferGeometry();
++  pulseGeo.setAttribute("position", new THREE.BufferAttribute(pulsePos, 3));
++  const pulses = new THREE.Points(
++    pulseGeo,
++    new THREE.PointsMaterial({
++      color: "#c3efdc",
++      map: dot,
++      size: 4,
++      sizeAttenuation: false,
++      transparent: true,
++      opacity: 0.75,
++      blending: THREE.AdditiveBlending,
++      depthWrite: false,
++      toneMapped: false,
++    })
++  );
++  pulses.frustumCulled = false;
++  scene.add(pulses);
++
++  // ---------- Wireframe structures ----------
++  const shapeGeos: THREE.BufferGeometry[] = [
++    new THREE.EdgesGeometry(new THREE.IcosahedronGeometry(1.4, 1)),
++    new THREE.EdgesGeometry(new THREE.OctahedronGeometry(1.7)),
++    new THREE.EdgesGeometry(new THREE.DodecahedronGeometry(1.4)),
++    new THREE.WireframeGeometry(new THREE.TorusKnotGeometry(0.9, 0.22, 72, 8)),
++    new THREE.EdgesGeometry(new THREE.BoxGeometry(2.4, 2.4, 2.4)),
++    new THREE.WireframeGeometry(new THREE.TorusGeometry(1.3, 0.35, 10, 28)),
++  ];
++  const shapeMat = new THREE.LineBasicMaterial({
++    color: "#2f9b78",
++    opacity: 0.6,
++    blending: THREE.AdditiveBlending,
++    depthWrite: false,
++    ...lineBase,
++  });
++  const shapes: { mesh: THREE.LineSegments; spin: THREE.Vector3 }[] = [];
++  for (let i = 0; i < 16; i++) {
++    const mesh = new THREE.LineSegments(shapeGeos[i % shapeGeos.length], shapeMat);
++    const side = i % 2 === 0 ? -1 : 1;
++    mesh.position.set(side * (2.9 + rand() * 1.5), -1 + rand() * 3.6, -28 - i * 20);
++    mesh.scale.setScalar(0.8 + rand() * 0.6);
++    scene.add(mesh);
++    shapes.push({
++      mesh,
++      spin: new THREE.Vector3(rand() * 0.3, 0.15 + rand() * 0.3, rand() * 0.2),
++    });
++  }
++
++  // ---------- Floating system interfaces ----------
++  const hudGeo = new THREE.PlaneGeometry(3.4, 2.125);
++  const hudEdgeGeo = new THREE.EdgesGeometry(hudGeo);
++  const hudEdgeMat = new THREE.LineBasicMaterial({
++    color: "#2c8f6d",
++    opacity: 0.7,
++    ...lineBase,
++  });
++  const huds: { group: THREE.Group; baseY: number; phase: number }[] = [];
++  for (let i = 0; i < 8; i++) {
++    const group = new THREE.Group();
++    const side = i % 2 === 0 ? -1 : 1;
++    const baseY = 0.2 + (i % 3) * 0.8;
++    group.position.set(side * 4.1, baseY, -36 - i * 36);
++    group.rotation.y = -side * 0.35;
++    const panel = new THREE.Mesh(
++      hudGeo,
++      new THREE.MeshBasicMaterial({
++        map: hudTexture(i),
++        transparent: true,
++        opacity: 0.88,
++        depthWrite: false,
++        toneMapped: false,
++      })
++    );
++    group.add(panel);
++    group.add(new THREE.LineSegments(hudEdgeGeo, hudEdgeMat));
++    scene.add(group);
++    huds.push({ group, baseY, phase: rand() * 6 });
++  }
++
++  // ---------- Gateway ----------
++  const gate = new THREE.Group();
++  gate.position.set(0, 0.6, GATE_Z);
++  scene.add(gate);
++
++  const ringSpecs: [number, string, number][] = [
++    [9, "#2a8c70", 0.12],
++    [6.4, "#2f9f9a", -0.2],
++    [4.2, "#58b99a", 0.3],
++  ];
++  const gateRings = ringSpecs.map(([radius, color, spin]) => {
++    const ring = new THREE.Mesh(
++      new THREE.TorusGeometry(radius, 0.09, 8, 128),
++      new THREE.MeshBasicMaterial({ color, toneMapped: false })
++    );
++    gate.add(ring);
++    return { ring, spin };
++  });
++  const core = new THREE.Mesh(
++    new THREE.IcosahedronGeometry(1.6, 1),
++    new THREE.MeshBasicMaterial({
++      color: "#3fa27f",
++      wireframe: true,
++      transparent: true,
++      opacity: 0.7,
++      toneMapped: false,
++    })
++  );
++  gate.add(core);
++  const glow = new THREE.Sprite(
++    new THREE.SpriteMaterial({
++      map: glowTexture(),
++      transparent: true,
++      opacity: 0.4,
++      blending: THREE.AdditiveBlending,
++      depthWrite: false,
++      fog: false,
++      toneMapped: false,
++    })
++  );
++  glow.scale.setScalar(44);
++  gate.add(glow);
++  const gateText = new THREE.Mesh(
++    new THREE.PlaneGeometry(20, 5),
++    new THREE.MeshBasicMaterial({
++      map: gateTextTexture(),
++      transparent: true,
++      depthWrite: false,
++      toneMapped: false,
++    })
++  );
++  gateText.position.set(0, -0.2, 0.4);
++  gate.add(gateText);
++
++  // ---------- Update ----------
++  let lastTime = 0;
++  const a = new THREE.Vector3();
++  const b = new THREE.Vector3();
++
++  function update(time: number) {
++    const dt = Math.min(0.1, Math.max(0, time - lastTime));
++    lastTime = time;
++
++    particleMat.uniforms.uTime.value = time;
++    gridUniforms.forEach((m) => (m.uniforms.uTime.value = time));
++
++    glyphA.offset.y -= dt * 0.22;
++    glyphB.offset.y -= dt * 0.34;
++
++    shapes.forEach(({ mesh, spin }) => {
++      mesh.rotation.x += spin.x * dt;
++      mesh.rotation.y += spin.y * dt;
++      mesh.rotation.z += spin.z * dt;
++    });
++
++    huds.forEach((h) => {
++      h.group.position.y = h.baseY + Math.sin(time * 0.6 + h.phase) * 0.08;
++    });
++
++    gateRings.forEach(({ ring, spin }) => (ring.rotation.z += spin * dt));
++    core.rotation.x += dt * 0.2;
++    core.rotation.y += dt * 0.35;
++    glow.material.opacity = 0.36 + Math.sin(time * 1.2) * 0.05;
++
++    pulseState.forEach((p, i) => {
++      p.t += p.speed * dt;
++      if (p.t > 1) {
++        p.t = 0;
++        p.edge = Math.floor(rand() * edges.length);
++      }
++      const [ea, eb] = edges[p.edge];
++      a.copy(nodes[ea]);
++      b.copy(nodes[eb]);
++      a.lerp(b, p.t);
++      pulsePos[i * 3] = a.x;
++      pulsePos[i * 3 + 1] = a.y;
++      pulsePos[i * 3 + 2] = a.z;
++    });
++    pulseGeo.attributes.position.needsUpdate = true;
++  }
++
++  return {
++    scene,
++    update,
++    /** Point-size scale; pass the render-target height in pixels. */
++    setViewportHeight(h: number) {
++      particleMat.uniforms.uScale.value = h * 0.55;
++    },
++    dispose() {
++      disposeObject(scene);
++      shapeGeos.forEach((g) => g.dispose());
++      hudEdgeGeo.dispose();
++      hudGeo.dispose();
++      glyphGeo.dispose();
++      glyphMats.forEach((m) => m.dispose());
++      glyphA.dispose();
++      glyphB.dispose();
++      nodeGeo.dispose();
++      dot.dispose();
++    },
++  };
++}
+diff --git a/src/app/components/BeyondTheScreen/room.ts b/src/app/components/BeyondTheScreen/room.ts
+new file mode 100644
+index 0000000..7f03f6d
+--- /dev/null
++++ b/src/app/components/BeyondTheScreen/room.ts
+@@ -0,0 +1,568 @@
++import * as THREE from "three";
++import { makeCanvas, mulberry32, smoothstep } from "./util";
++
++/* All dimensions are in metres. +z points toward the viewer / hallway,
++   the partition wall with the door sits at z = 0, the desk is at z ≈ -6.7. */
++
++export const LAPTOP_SCALE = 1.25;
++export const SCREEN_W = 0.392 * LAPTOP_SCALE;
++export const SCREEN_H = 0.245 * LAPTOP_SCALE;
++export const DOOR_OPEN_ANGLE = 1.9;
++
++function woodTexture() {
++  const rand = mulberry32(7);
++  const { canvas, ctx } = makeCanvas(512, 1024);
++  ctx.fillStyle = "#2a1d17";
++  ctx.fillRect(0, 0, 512, 1024);
++  for (let i = 0; i < 220; i++) {
++    const x = rand() * 512;
++    const w = 1 + rand() * 3;
++    ctx.strokeStyle =
++      rand() > 0.5
++        ? `rgba(0,0,0,${0.1 + rand() * 0.2})`
++        : `rgba(104,72,52,${0.06 + rand() * 0.12})`;
++    ctx.lineWidth = w;
++    ctx.beginPath();
++    ctx.moveTo(x, 0);
++    for (let y = 0; y <= 1024; y += 64) {
++      ctx.lineTo(x + Math.sin(y * 0.01 + i) * 6 * rand(), y);
++    }
++    ctx.stroke();
++  }
++  const tex = new THREE.CanvasTexture(canvas);
++  tex.colorSpace = THREE.SRGBColorSpace;
++  tex.anisotropy = 8;
++  return tex;
++}
++
++function noiseTexture(base: string, amount: number, repeatX: number, repeatY: number) {
++  const rand = mulberry32(21);
++  const { canvas, ctx } = makeCanvas(256, 256);
++  ctx.fillStyle = base;
++  ctx.fillRect(0, 0, 256, 256);
++  for (let i = 0; i < 5000; i++) {
++    const v = rand() > 0.5 ? 255 : 0;
++    ctx.fillStyle = `rgba(${v},${v},${v},${rand() * amount})`;
++    ctx.fillRect(rand() * 256, rand() * 256, 1 + rand() * 2, 1 + rand() * 2);
++  }
++  const tex = new THREE.CanvasTexture(canvas);
++  tex.colorSpace = THREE.SRGBColorSpace;
++  tex.wrapS = THREE.RepeatWrapping;
++  tex.wrapT = THREE.RepeatWrapping;
++  tex.repeat.set(repeatX, repeatY);
++  tex.anisotropy = 4;
++  return tex;
++}
++
++function blindsTexture() {
++  const { canvas, ctx } = makeCanvas(256, 256);
++  const g = ctx.createLinearGradient(0, 0, 0, 256);
++  g.addColorStop(0, "#5f8f93");
++  g.addColorStop(1, "#27403f");
++  ctx.fillStyle = g;
++  ctx.fillRect(0, 0, 256, 256);
++  ctx.fillStyle = "rgba(0,0,0,0.78)";
++  for (let y = 0; y < 256; y += 16) ctx.fillRect(0, y + 9, 256, 7);
++  const tex = new THREE.CanvasTexture(canvas);
++  tex.colorSpace = THREE.SRGBColorSpace;
++  return tex;
++}
++
++function networkMapTexture() {
++  const rand = mulberry32(5);
++  const { canvas, ctx } = makeCanvas(512, 320);
++  ctx.fillStyle = "#050c09";
++  ctx.fillRect(0, 0, 512, 320);
++  ctx.strokeStyle = "#16382b";
++  ctx.lineWidth = 2;
++  ctx.strokeRect(2, 2, 508, 316);
++  const pts = Array.from({ length: 22 }, () => [24 + rand() * 464, 24 + rand() * 272]);
++  ctx.strokeStyle = "rgba(61,158,152,0.45)";
++  ctx.lineWidth = 1.2;
++  pts.forEach((p, i) => {
++    const q = pts[(i * 7 + 2) % pts.length];
++    ctx.beginPath();
++    ctx.moveTo(p[0], p[1]);
++    ctx.lineTo(q[0], q[1]);
++    ctx.stroke();
++  });
++  pts.forEach((p) => {
++    ctx.fillStyle = "#4fae80";
++    ctx.fillRect(p[0] - 3, p[1] - 3, 6, 6);
++  });
++  const tex = new THREE.CanvasTexture(canvas);
++  tex.colorSpace = THREE.SRGBColorSpace;
++  return tex;
++}
++
++function monitorTexture() {
++  const rand = mulberry32(13);
++  const { canvas, ctx } = makeCanvas(512, 220);
++  ctx.fillStyle = "#040a08";
++  ctx.fillRect(0, 0, 512, 220);
++  ctx.font = "12px ui-monospace, Menlo, Consolas, monospace";
++  for (let i = 0; i < 15; i++) {
++    const indent = Math.floor(rand() * 4) * 16;
++    const len = 60 + rand() * 260;
++    ctx.fillStyle = ["#2d6e57", "#3d8a85", "#6b6b44", "#2d6e57"][i % 4];
++    ctx.fillRect(18 + indent, 18 + i * 13, len, 5);
++  }
++  ctx.fillStyle = "#0b1d15";
++  ctx.fillRect(360, 18, 134, 184);
++  for (let i = 0; i < 9; i++) {
++    ctx.fillStyle = "#2f8f6c";
++    ctx.fillRect(370, 30 + i * 19, 20 + rand() * 100, 8);
++  }
++  const tex = new THREE.CanvasTexture(canvas);
++  tex.colorSpace = THREE.SRGBColorSpace;
++  return tex;
++}
++
++export function createRoom(screenMaterial: THREE.Material) {
++  const group = new THREE.Group();
++  const rand = mulberry32(99);
++
++  // ---------- Materials ----------
++  const woodTex = woodTexture();
++  const concrete = noiseTexture("#1b2020", 0.07, 3, 1.5);
++  const floorNoise = noiseTexture("#101414", 0.1, 4, 6);
++
++  const wallMat = new THREE.MeshStandardMaterial({ map: concrete, color: "#9aa5a2", roughness: 0.92 });
++  const floorMat = new THREE.MeshStandardMaterial({ map: floorNoise, color: "#8f9996", roughness: 0.3, metalness: 0.12 });
++  const ceilMat = new THREE.MeshStandardMaterial({ color: "#0c0f0f", roughness: 1 });
++  const woodMat = new THREE.MeshStandardMaterial({ map: woodTex, bumpMap: woodTex, bumpScale: 0.6, color: "#7d736b", roughness: 0.5, metalness: 0.05 });
++  const woodPanelMat = new THREE.MeshStandardMaterial({ map: woodTex, color: "#6f655d", roughness: 0.62 });
++  const metalMat = new THREE.MeshStandardMaterial({ color: "#2e3436", metalness: 0.85, roughness: 0.34 });
++  const darkMetal = new THREE.MeshStandardMaterial({ color: "#141819", metalness: 0.7, roughness: 0.45 });
++  const deskMat = new THREE.MeshStandardMaterial({ map: woodTex, color: "#6e6259", roughness: 0.45, metalness: 0.05 });
++  const plastic = new THREE.MeshStandardMaterial({ color: "#0d1011", roughness: 0.55, metalness: 0.2 });
++  const silhouette = new THREE.MeshStandardMaterial({ color: "#060808", roughness: 0.95, metalness: 0 });
++  const rugMat = new THREE.MeshStandardMaterial({ color: "#0c1211", roughness: 1 });
++
++  const box = (
++    w: number, h: number, d: number, mat: THREE.Material,
++    x: number, y: number, z: number, parent: THREE.Object3D = group,
++    cast = true, receive = true
++  ) => {
++    const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
++    m.position.set(x, y, z);
++    m.castShadow = cast;
++    m.receiveShadow = receive;
++    parent.add(m);
++    return m;
++  };
++
++  const limb = (a: THREE.Vector3, b: THREE.Vector3, r: number, parent: THREE.Object3D) => {
++    const len = a.distanceTo(b);
++    const m = new THREE.Mesh(new THREE.CapsuleGeometry(r, Math.max(0.001, len - 2 * r), 4, 10), silhouette);
++    m.position.copy(a).add(b).multiplyScalar(0.5);
++    m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), b.clone().sub(a).normalize());
++    m.castShadow = true;
++    parent.add(m);
++    return m;
++  };
++
++  // ---------- Shell ----------
++  const ROOM_X = 3.2;
++  const FRONT = 6;
++  const BACK = -7.4;
++  const HEIGHT = 3;
++  const depth = FRONT - BACK;
++  const midZ = (FRONT + BACK) / 2;
++
++  box(ROOM_X * 2, 0.1, depth, floorMat, 0, -0.05, midZ, group, false, true);
++  box(ROOM_X * 2, 0.1, depth, ceilMat, 0, HEIGHT + 0.05, midZ, group, false, true);
++  box(0.1, HEIGHT, depth, wallMat, -ROOM_X - 0.05, HEIGHT / 2, midZ, group, false, true);
++  box(0.1, HEIGHT, depth, wallMat, ROOM_X + 0.05, HEIGHT / 2, midZ, group, false, true);
++  box(ROOM_X * 2, HEIGHT, 0.1, wallMat, 0, HEIGHT / 2, BACK - 0.05, group, false, true);
++
++  // Partition wall with a door opening 1.0 x 2.2
++  const OPEN_W = 1.0;
++  const OPEN_H = 2.2;
++  const sideW = ROOM_X - OPEN_W / 2;
++  box(sideW, HEIGHT, 0.24, wallMat, -(OPEN_W / 2 + sideW / 2), HEIGHT / 2, 0);
++  box(sideW, HEIGHT, 0.24, wallMat, OPEN_W / 2 + sideW / 2, HEIGHT / 2, 0);
++  box(OPEN_W, HEIGHT - OPEN_H, 0.24, wallMat, 0, OPEN_H + (HEIGHT - OPEN_H) / 2, 0);
++
++  // Skirting and light trim
++  box(ROOM_X * 2, 0.09, 0.03, darkMetal, 0, 0.045, 0.135, group, false, true);
++  box(0.03, 0.09, 6, darkMetal, -ROOM_X + 0.02, 0.045, 3, group, false, true);
++  box(0.03, 0.09, 6, darkMetal, ROOM_X - 0.02, 0.045, 3, group, false, true);
++
++  // ---------- Door frame ----------
++  box(0.07, OPEN_H + 0.07, 0.26, metalMat, -OPEN_W / 2 - 0.035, (OPEN_H + 0.07) / 2, 0);
++  box(0.07, OPEN_H + 0.07, 0.26, metalMat, OPEN_W / 2 + 0.035, (OPEN_H + 0.07) / 2, 0);
++  box(OPEN_W + 0.14, 0.07, 0.26, metalMat, 0, OPEN_H + 0.035, 0);
++
++  // ---------- Door leaf (hinged at the left jamb, swings inward) ----------
++  const doorPivot = new THREE.Group();
++  doorPivot.position.set(-OPEN_W / 2 + 0.03, 0, 0);
++  group.add(doorPivot);
++
++  const leafW = OPEN_W - 0.06;
++  const leafH = OPEN_H - 0.03;
++  box(leafW, leafH, 0.05, woodMat, leafW / 2, 0.03 + leafH / 2, 0, doorPivot);
++
++  for (const face of [1, -1]) {
++    for (let col = 0; col < 2; col++) {
++      for (let row = 0; row < 3; row++) {
++        const pw = 0.33;
++        const ph = row === 1 ? 0.62 : 0.52;
++        const py = [0.5, 1.1, 1.78][row] - (row === 1 ? 0.0 : 0);
++        box(pw, ph, 0.012, woodPanelMat, 0.25 + col * 0.42, py, face * 0.029, doorPivot);
++      }
++    }
++  }
++  box(leafW, 0.17, 0.056, metalMat, leafW / 2, 0.12, 0, doorPivot);
++
++  // Lever handle (both sides)
++  for (const face of [1, -1]) {
++    box(0.05, 0.11, 0.012, metalMat, leafW - 0.07, 1.05, face * 0.034, doorPivot);
++    const lever = new THREE.Mesh(new THREE.CylinderGeometry(0.009, 0.009, 0.13, 10), metalMat);
++    lever.rotation.z = Math.PI / 2;
++    lever.position.set(leafW - 0.13, 1.05, face * 0.065);
++    lever.castShadow = true;
++    doorPivot.add(lever);
++  }
++  // Hinges
++  [0.25, 1.1, 1.95].forEach((y) =>
++    box(0.045, 0.14, 0.07, metalMat, -0.005, y, 0, doorPivot)
++  );
++
++  // ---------- Keypad beside the door ----------
++  box(0.09, 0.15, 0.025, plastic, 0.76, 1.2, 0.132);
++  const keypadLed = new THREE.Mesh(
++    new THREE.BoxGeometry(0.018, 0.018, 0.004),
++    new THREE.MeshBasicMaterial({ color: "#2f8a63", toneMapped: false })
++  );
++  keypadLed.position.set(0.76, 1.255, 0.146);
++  group.add(keypadLed);
++  for (let r = 0; r < 4; r++) {
++    for (let c = 0; c < 3; c++) {
++      const k = new THREE.Mesh(
++        new THREE.BoxGeometry(0.016, 0.012, 0.004),
++        new THREE.MeshBasicMaterial({ color: "#1b3a2d", toneMapped: false })
++      );
++      k.position.set(0.735 + c * 0.025, 1.21 - r * 0.02, 0.146);
++      group.add(k);
++    }
++  }
++
++  // Light leaking under the closed door
++  const leakCanvas = makeCanvas(8, 64);
++  const lg = leakCanvas.ctx.createLinearGradient(0, 0, 0, 64);
++  lg.addColorStop(0, "rgba(80,190,150,0.9)");
++  lg.addColorStop(1, "rgba(80,190,150,0)");
++  leakCanvas.ctx.fillStyle = lg;
++  leakCanvas.ctx.fillRect(0, 0, 8, 64);
++  const leakTex = new THREE.CanvasTexture(leakCanvas.canvas);
++  leakTex.colorSpace = THREE.SRGBColorSpace;
++  const leakMat = new THREE.MeshBasicMaterial({
++    map: leakTex, transparent: true, opacity: 0.45,
++    blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
++  });
++  const leak = new THREE.Mesh(new THREE.PlaneGeometry(0.95, 0.4), leakMat);
++  leak.rotation.x = -Math.PI / 2;
++  leak.position.set(0, 0.004, 0.34);
++  group.add(leak);
++
++  // ---------- Desk ----------
++  const desk = new THREE.Group();
++  desk.position.set(0.35, 0, -6.75);
++  group.add(desk);
++  box(2.5, 0.045, 0.82, deskMat, 0, 0.745, 0, desk);
++  [[-1.15, -0.34], [1.15, -0.34], [-1.15, 0.34], [1.15, 0.34]].forEach(([x, z]) =>
++    box(0.05, 0.72, 0.05, darkMetal, x, 0.36, z, desk)
++  );
++  box(2.3, 0.04, 0.04, darkMetal, 0, 0.28, -0.34, desk);
++
++  // Rug
++  box(3.2, 0.01, 2.4, rugMat, 0.3, 0.005, -5.5, group, false, true);
++
++  // ---------- Laptop ----------
++  const laptop = new THREE.Group();
++  laptop.position.set(-0.4, 0.768, -6.62);
++  laptop.scale.setScalar(LAPTOP_SCALE);
++  group.add(laptop);
++
++  box(0.42, 0.016, 0.29, darkMetal, 0, 0.008, 0, laptop);
++  const glowStrip = new THREE.Mesh(
++    new THREE.PlaneGeometry(0.37, 0.12),
++    new THREE.MeshBasicMaterial({ color: "#10301f", toneMapped: false })
++  );
++  glowStrip.rotation.x = -Math.PI / 2;
++  glowStrip.position.set(0, 0.0165, -0.045);
++  laptop.add(glowStrip);
++
++  const keyGeo = new THREE.BoxGeometry(0.0225, 0.006, 0.0215);
++  const keys = new THREE.InstancedMesh(keyGeo, plastic, 5 * 14);
++  const m4 = new THREE.Matrix4();
++  let ki = 0;
++  for (let r = 0; r < 5; r++) {
++    for (let c = 0; c < 14; c++) {
++      m4.setPosition((c - 6.5) * 0.0265, 0.019, -0.095 + r * 0.0245);
++      keys.setMatrixAt(ki++, m4);
++    }
++  }
++  keys.instanceMatrix.needsUpdate = true;
++  laptop.add(keys);
++  box(0.11, 0.002, 0.07, darkMetal, 0, 0.0165, 0.105, laptop, false, true);
++
++  const lid = new THREE.Group();
++  lid.position.set(0, 0.018, -0.14);
++  lid.rotation.x = -0.2618; // 105 degree opening
++  laptop.add(lid);
++  box(0.42, 0.285, 0.012, plastic, 0, 0.1425, 0, lid);
++
++  const screen = new THREE.Mesh(new THREE.PlaneGeometry(0.392, 0.245), screenMaterial);
++  screen.position.set(0, 0.145, 0.0066);
++  lid.add(screen);
++
++  // ---------- Secondary monitor ----------
++  const monitor = new THREE.Group();
++  monitor.position.set(1.05, 0.768, -6.98);
++  group.add(monitor);
++  box(0.9, 0.38, 0.03, plastic, 0, 0.36, 0, monitor);
++  box(0.06, 0.2, 0.04, darkMetal, 0, 0.1, -0.03, monitor);
++  box(0.28, 0.012, 0.18, darkMetal, 0, 0.006, -0.02, monitor);
++  const monitorScreen = new THREE.Mesh(
++    new THREE.PlaneGeometry(0.86, 0.34),
++    new THREE.MeshBasicMaterial({ map: monitorTexture(), color: "#7aa090", toneMapped: false })
++  );
++  monitorScreen.position.set(0, 0.36, 0.0156);
++  monitor.add(monitorScreen);
++  box(0.46, 0.012, 0.15, darkMetal, -0.1, 0.006, 0.28, monitor);
++  box(0.12, 0.03, 0.2, plastic, 0.32, 0.015, 0.3, monitor);
++
++  // Mug
++  const mug = new THREE.Mesh(new THREE.CylinderGeometry(0.04, 0.034, 0.09, 20), darkMetal);
++  mug.position.set(-0.78, 0.812, -6.55);
++  mug.castShadow = true;
++  group.add(mug);
++
++  // Cables
++  const cable = new THREE.Mesh(
++    new THREE.TubeGeometry(
++      new THREE.CatmullRomCurve3([
++        new THREE.Vector3(-0.4, 0.77, -6.82),
++        new THREE.Vector3(-0.35, 0.74, -7.0),
++        new THREE.Vector3(-0.2, 0.3, -7.15),
++        new THREE.Vector3(-0.1, 0.02, -7.2),
++      ]),
++      24, 0.008, 6
++    ),
++    plastic
++  );
++  group.add(cable);
++
++  // ---------- Developer + chair (seen from behind, facing the monitor) ----------
++  const dev = new THREE.Group();
++  dev.position.set(1.05, 0, -5.9);
++  group.add(dev);
++
++  box(0.46, 0.06, 0.44, silhouette, 0, 0.47, 0, dev);
++  box(0.44, 0.58, 0.06, silhouette, 0, 0.84, 0.23, dev);
++  box(0.3, 0.17, 0.05, silhouette, 0, 1.26, 0.23, dev);
++  const lift = new THREE.Mesh(new THREE.CylinderGeometry(0.025, 0.025, 0.4, 10), darkMetal);
++  lift.position.set(0, 0.25, 0);
++  dev.add(lift);
++  for (let i = 0; i < 5; i++) {
++    const ang = (i / 5) * Math.PI * 2;
++    const arm = box(0.3, 0.025, 0.035, darkMetal, Math.cos(ang) * 0.15, 0.05, Math.sin(ang) * 0.15, dev);
++    arm.rotation.y = -ang;
++    const wheel = new THREE.Mesh(new THREE.SphereGeometry(0.028, 10, 8), darkMetal);
++    wheel.position.set(Math.cos(ang) * 0.29, 0.03, Math.sin(ang) * 0.29);
++    dev.add(wheel);
++  }
++
++  const torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.17, 0.36, 6, 14), silhouette);
++  torso.scale.set(1.25, 1, 0.85);
++  torso.position.set(0, 0.96, 0.02);
++  torso.rotation.x = -0.14;
++  torso.castShadow = true;
++  dev.add(torso);
++
++  const shoulders = new THREE.Mesh(new THREE.CapsuleGeometry(0.075, 0.34, 4, 10), silhouette);
++  shoulders.rotation.z = Math.PI / 2;
++  shoulders.position.set(0, 1.18, -0.02);
++  shoulders.castShadow = true;
++  dev.add(shoulders);
++
++  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.055, 0.1, 10), silhouette);
++  neck.position.set(0, 1.29, -0.04);
++  dev.add(neck);
++
++  const head = new THREE.Mesh(new THREE.SphereGeometry(0.115, 20, 16), silhouette);
++  head.scale.set(0.95, 1.12, 1.05);
++  head.position.set(0, 1.43, -0.07);
++  head.castShadow = true;
++  dev.add(head);
++
++  const band = new THREE.Mesh(new THREE.TorusGeometry(0.125, 0.011, 8, 28, Math.PI), darkMetal);
++  band.rotation.set(0, Math.PI / 2, 0);
++  band.position.set(0, 1.44, -0.07);
++  dev.add(band);
++  [-1, 1].forEach((s) => {
++    const cup = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.035, 16), darkMetal);
++    cup.rotation.z = Math.PI / 2;
++    cup.position.set(s * 0.122, 1.43, -0.07);
++    dev.add(cup);
++  });
++
++  [-1, 1].forEach((s) => {
++    const shoulder = new THREE.Vector3(s * 0.21, 1.17, -0.02);
++    const elbow = new THREE.Vector3(s * 0.26, 0.93, -0.2);
++    const hand = new THREE.Vector3(s * 0.15, 0.82, -0.5);
++    limb(shoulder, elbow, 0.055, dev);
++    limb(elbow, hand, 0.045, dev);
++    const knee = new THREE.Vector3(s * 0.13, 0.55, -0.42);
++    limb(new THREE.Vector3(s * 0.12, 0.54, 0.05), knee, 0.075, dev);
++    limb(knee, new THREE.Vector3(s * 0.13, 0.08, -0.46), 0.06, dev);
++  });
++
++  // ---------- Environmental details ----------
++  // Server rack (left wall)
++  const rack = new THREE.Group();
++  rack.position.set(-2.75, 0, -5.4);
++  group.add(rack);
++  box(0.8, 1.9, 0.7, darkMetal, 0, 0.95, 0, rack);
++  for (let i = 0; i < 9; i++) box(0.01, 0.12, 0.62, plastic, 0.405, 0.2 + i * 0.19, 0, rack);
++
++  const LEDS = 54;
++  const ledMesh = new THREE.InstancedMesh(
++    new THREE.BoxGeometry(0.006, 0.01, 0.01),
++    new THREE.MeshBasicMaterial({ toneMapped: false }),
++    LEDS
++  );
++  const ledColors = [new THREE.Color("#2f8a63"), new THREE.Color("#2a7c78"), new THREE.Color("#8a7a4a"), new THREE.Color("#0a1410")];
++  for (let i = 0; i < LEDS; i++) {
++    const row = Math.floor(i / 6);
++    const col = i % 6;
++    m4.setPosition(0.412, 0.2 + row * 0.19 + 0.02, -0.25 + col * 0.045);
++    ledMesh.setMatrixAt(i, m4);
++    ledMesh.setColorAt(i, ledColors[Math.floor(rand() * 3)]);
++  }
++  rack.add(ledMesh);
++
++  // Shelf with boxes (right wall)
++  const shelf = new THREE.Group();
++  shelf.position.set(3.0, 0, -5.2);
++  group.add(shelf);
++  [0.9, 1.4, 1.9].forEach((y) => {
++    box(0.3, 0.03, 1.6, darkMetal, 0, y, 0, shelf);
++    let z = -0.7;
++    while (z < 0.7) {
++      const w = 0.05 + rand() * 0.08;
++      const h = 0.14 + rand() * 0.18;
++      const shade = Math.floor(10 + rand() * 18);
++      const mat = new THREE.MeshStandardMaterial({ color: `rgb(${shade},${shade + 3},${shade + 2})`, roughness: 0.8 });
++      box(0.2, h, w, mat, 0, y + 0.015 + h / 2, z + w / 2, shelf);
++      z += w + 0.01;
++    }
++  });
++
++  // Window with blinds
++  const windowMat = new THREE.MeshBasicMaterial({
++    map: blindsTexture(), transparent: true, opacity: 0.5, toneMapped: false,
++  });
++  const win = new THREE.Mesh(new THREE.PlaneGeometry(1.3, 1.1), windowMat);
++  win.position.set(3.19, 1.7, -2.6);
++  win.rotation.y = -Math.PI / 2;
++  group.add(win);
++
++  // Network map on the back wall
++  const mapPlane = new THREE.Mesh(
++    new THREE.PlaneGeometry(1.5, 0.94),
++    new THREE.MeshBasicMaterial({ map: networkMapTexture(), color: "#6d8c80", transparent: true, opacity: 0.8, toneMapped: false })
++  );
++  mapPlane.position.set(-1.9, 1.55, -7.39);
++  group.add(mapPlane);
++
++  // Ceiling light strip over the desk
++  box(1.6, 0.02, 0.06, new THREE.MeshBasicMaterial({ color: "#6f8f84", toneMapped: false }), 0.3, 2.98, -5.2, group, false, false);
++
++  // ---------- Lights ----------
++  group.add(new THREE.AmbientLight("#6f8a80", 0.1));
++
++  const hallSpot = new THREE.SpotLight("#cfe3da", 85, 10, 0.7, 0.8, 2);
++  hallSpot.position.set(0.5, 2.9, 2.3);
++  hallSpot.target.position.set(0, 1.0, 0);
++  hallSpot.castShadow = true;
++  hallSpot.shadow.mapSize.set(1024, 1024);
++  hallSpot.shadow.bias = -0.0006;
++  group.add(hallSpot, hallSpot.target);
++
++  const hallFill = new THREE.PointLight("#5f8a7a", 5, 8, 2);
++  hallFill.position.set(-1.2, 2.2, 3.4);
++  group.add(hallFill);
++
++  const keySpot = new THREE.SpotLight("#a9c9bd", 0, 11, 0.95, 0.9, 2);
++  keySpot.position.set(0.2, 2.95, -4.0);
++  keySpot.target.position.set(0, 0.75, -6.4);
++  keySpot.castShadow = true;
++  keySpot.shadow.mapSize.set(1024, 1024);
++  keySpot.shadow.bias = -0.0006;
++  group.add(keySpot, keySpot.target);
++
++  const roomFill = new THREE.PointLight("#6b8d82", 0, 9, 2);
++  roomFill.position.set(0, 2.6, -2.2);
++  group.add(roomFill);
++
++  const windowSpot = new THREE.SpotLight("#4d7a85", 0, 8, 0.8, 0.9, 2);
++  windowSpot.position.set(3.1, 1.8, -2.6);
++  windowSpot.target.position.set(0.3, 0.6, -4.8);
++  group.add(windowSpot, windowSpot.target);
++
++  const screenLight = new THREE.PointLight("#3f9e7c", 1.6, 4.5, 2);
++  screenLight.position.set(-0.4, 1.0, -6.2);
++  group.add(screenLight);
++
++  const monitorLight = new THREE.PointLight("#2f7f86", 1.1, 4, 2);
++  monitorLight.position.set(1.05, 1.15, -6.6);
++  group.add(monitorLight);
++
++  const rimLight = new THREE.PointLight("#4d8a8a", 1.5, 5, 2);
++  rimLight.position.set(1.05, 1.6, -4.7);
++  group.add(rimLight);
++
++  // ---------- Dynamic state ----------
++  const keyBase = 32;
++  const fillBase = 3.2;
++  const windowBase = 18;
++  let lastLed = 0;
++
++  function setDoor(v: number) {
++    doorPivot.rotation.y = v * DOOR_OPEN_ANGLE;
++    const gain = smoothstep(0.02, 0.7, v);
++    keySpot.intensity = keyBase * gain;
++    roomFill.intensity = fillBase * gain;
++    windowSpot.intensity = windowBase * gain;
++    leakMat.opacity = 0.45 * (1 - smoothstep(0, 0.12, v));
++  }
++
++  function update(time: number) {
++    screenLight.intensity = 1.6 + Math.sin(time * 7.3) * 0.06 + Math.sin(time * 2.1) * 0.08;
++    keypadLed.visible = Math.sin(time * 2.4) > -0.55;
++    torso.scale.y = 1 + Math.sin(time * 1.1) * 0.012;
++
++    if (time - lastLed > 0.35) {
++      lastLed = time;
++      for (let i = 0; i < 6; i++) {
++        ledMesh.setColorAt(Math.floor(Math.random() * LEDS), ledColors[Math.floor(Math.random() * 4)]);
++      }
++      if (ledMesh.instanceColor) ledMesh.instanceColor.needsUpdate = true;
++    }
++  }
++
++  // Receive shadows on everything static
++  group.traverse((o) => {
++    const mesh = o as THREE.Mesh;
++    if (mesh.isMesh && mesh.material instanceof THREE.MeshStandardMaterial) {
++      mesh.receiveShadow = true;
++    }
++  });
++
++  setDoor(0);
++
++  return { group, screen, setDoor, update };
++}
+diff --git a/src/app/components/BeyondTheScreen/scene.ts b/src/app/components/BeyondTheScreen/scene.ts
+index a936349..1e2aea2 100644
+--- a/src/app/components/BeyondTheScreen/scene.ts
++++ b/src/app/components/BeyondTheScreen/scene.ts
+@@ -1,702 +1,339 @@
+-
+ import * as THREE from "three";
++import { createTerminal, SCREEN_ASPECT } from "./terminal";
++import { createRoom, SCREEN_W, SCREEN_H } from "./room";
++import { createDigitalWorld, DEPTH_MAX } from "./digital";
++import { disposeObject, smoothstep } from "./util";
++
++/**
++ * Scroll-driven state. Each field is owned by exactly one tween so the two
++ * ScrollTrigger timelines can never fight over the same property.
++ */
++export interface JourneyState {
++  door: number; // 0..1  door swing
++  walk: number; // 0..1  camera path from hallway to the laptop
++  approach: number; // 0..1  dolly onto the screen's normal axis
++  mix: number; // 0..1  terminal -> digital world dissolve on the screen
++  depthPre: number; // 0..PRE  digital camera drift while still inside the screen
++  depthMain: number; // 0..(DEPTH_MAX-PRE)  travel after the portal swap
++}
+ 
+-export function createScene(container: HTMLDivElement) {
+-  // =====================================
+-  // SCENE, CAMERA AND RENDERER
+-  // =====================================
++export const DEPTH_PRE_MAX = 10;
++export const DEPTH_MAIN_MAX = DEPTH_MAX - DEPTH_PRE_MAX;
+ 
+-  const scene = new THREE.Scene();
+-  scene.background = new THREE.Color("#050706");
+-  scene.fog = new THREE.Fog("#050706", 18, 65);
++const RT_FOV = 58;
++const rad = THREE.MathUtils.degToRad;
++const deg = THREE.MathUtils.radToDeg;
+ 
+-  const camera = new THREE.PerspectiveCamera(
+-    48,
+-    window.innerWidth / window.innerHeight,
+-    0.1,
+-    150
+-  );
++const SCREEN_VERT = /* glsl */ `
++  varying vec2 vUv;
++  void main() {
++    vUv = uv;
++    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
++  }
++`;
++
++const SCREEN_FRAG = /* glsl */ `
++  uniform sampler2D uTerm;
++  uniform sampler2D uDig;
++  uniform float uMix;
++  uniform float uTime;
++  varying vec2 vUv;
++
++  void main() {
++    vec2 uv = vUv;
++    vec2 p = (uv - 0.5) * vec2(1.6, 1.0);
++    float r = length(p);
++
++    float edge = uMix * 1.3;
++    float w = 0.14;
++    float inside = 1.0 - smoothstep(edge - w, edge, r);
++    float going = step(0.001, uMix) * (1.0 - step(0.999, uMix));
++    float ring = exp(-pow((r - edge + w * 0.5) / (w * 0.55), 2.0)) * going;
++
++    vec2 dir = normalize(p + vec2(1e-5));
++    vec2 off = dir * 0.006 * ring;
++    vec3 dig = vec3(
++      texture2D(uDig, uv + off).r,
++      texture2D(uDig, uv).g,
++      texture2D(uDig, uv - off).b
++    );
++    vec3 term = texture2D(uTerm, uv).rgb;
+ 
+-  camera.position.set(0, 2.1, 10);
+-  camera.lookAt(0, 1.5, 0);
++    vec3 col = mix(term, dig, inside);
++    col += vec3(0.03, 0.22, 0.16) * ring;
+ 
++    // glass / CRT feel, fully faded once the portal has opened
++    float fx = 1.0 - uMix;
++    float scan = 0.955 + 0.045 * sin(uv.y * 780.0 + uTime * 2.0);
++    float vig = 1.0 - 0.35 * smoothstep(0.35, 0.95, r);
++    col *= mix(1.0, scan * vig, fx);
++
++    gl_FragColor = vec4(col, 1.0);
++    #include <colorspace_fragment>
++  }
++`;
++
++export function createScene(container: HTMLElement) {
++  // ---------- Renderer ----------
+   const renderer = new THREE.WebGLRenderer({
+     antialias: true,
+     alpha: false,
++    powerPreference: "high-performance",
+   });
+-
+   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+-  renderer.setSize(window.innerWidth, window.innerHeight);
+   renderer.outputColorSpace = THREE.SRGBColorSpace;
+   renderer.toneMapping = THREE.ACESFilmicToneMapping;
+-  renderer.toneMappingExposure = 0.85;
+-
+-  // =====================================
+-  // MATERIALS
+-  // =====================================
+-
+-  const wallMat = new THREE.MeshStandardMaterial({
+-    color: "#101310",
+-    roughness: 0.95,
+-  });
+-
+-  const darkMat = new THREE.MeshStandardMaterial({
+-    color: "#080a09",
+-    roughness: 0.9,
+-  });
+-
+-  const floorMat = new THREE.MeshStandardMaterial({
+-    color: "#0b0e0c",
+-    roughness: 0.55,
+-    metalness: 0.15,
+-  });
+-
+-  const doorMat = new THREE.MeshStandardMaterial({
+-    color: "#191a17",
+-    roughness: 0.82,
+-    metalness: 0.12,
+-  });
++  renderer.toneMappingExposure = 1.1;
++  renderer.shadowMap.enabled = true;
++  renderer.shadowMap.type = THREE.PCFShadowMap;
+ 
+-  const doorPanelMat = new THREE.MeshStandardMaterial({
+-    color: "#10120f",
+-    roughness: 0.9,
+-  });
++  const canvas = renderer.domElement;
++  canvas.addEventListener("webglcontextlost", (e) => e.preventDefault());
+ 
+-  const metalMat = new THREE.MeshStandardMaterial({
+-    color: "#343b36",
+-    metalness: 0.55,
+-    roughness: 0.42,
++  const size = () => ({
++    w: Math.max(1, container.clientWidth || window.innerWidth),
++    h: Math.max(1, container.clientHeight || window.innerHeight),
+   });
+ 
+-  const silhouetteMat = new THREE.MeshStandardMaterial({
+-    color: "#050706",
+-    roughness: 1,
++  // ---------- Portal render target (digital world seen through the screen) ----------
++  const floatOk =
++    renderer.extensions.has("EXT_color_buffer_float") ||
++    renderer.extensions.has("EXT_color_buffer_half_float");
++  const RT_W = 1536;
++  const RT_H = Math.round(RT_W / SCREEN_ASPECT);
++  const rt = new THREE.WebGLRenderTarget(RT_W, RT_H, {
++    samples: 4,
++    type: floatOk ? THREE.HalfFloatType : THREE.UnsignedByteType,
+   });
+ 
+-  const mutedGreen = "#527d61";
+-  const softGreen = "#78a88a";
+-
+-  // =====================================
+-  // HELPERS
+-  // =====================================
+-
+-  function addBox(
+-    parent: THREE.Group,
+-    size: [number, number, number],
+-    position: [number, number, number],
+-    material: THREE.Material
+-  ) {
+-    const mesh = new THREE.Mesh(
+-      new THREE.BoxGeometry(...size),
+-      material
+-    );
+-
+-    mesh.position.set(...position);
+-    mesh.castShadow = true;
+-    mesh.receiveShadow = true;
+-    parent.add(mesh);
+-
+-    return mesh;
+-  }
+-
+-  function addLine(
+-    parent: THREE.Group,
+-    points: THREE.Vector3[],
+-    color: string,
+-    opacity = 0.35
+-  ) {
+-    const geometry = new THREE.BufferGeometry().setFromPoints(points);
+-
+-    const material = new THREE.LineBasicMaterial({
+-      color,
+-      transparent: true,
+-      opacity,
+-    });
+-
+-    const line = new THREE.Line(geometry, material);
+-    parent.add(line);
++  // ---------- Content ----------
++  const terminal = createTerminal();
++  terminal.texture.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+ 
+-    return line;
+-  }
+-
+-  // =====================================
+-  // MAIN ROOM
+-  // =====================================
+-
+-  const room = new THREE.Group();
+-  scene.add(room);
+-
+-  addBox(room, [18, 0.2, 30], [0, -0.12, -8], floorMat);
+-  addBox(room, [18, 7, 0.2], [0, 3.4, -22], wallMat);
+-  addBox(room, [0.2, 7, 30], [-9, 3.4, -8], wallMat);
+-  addBox(room, [0.2, 7, 30], [9, 3.4, -8], wallMat);
+-  addBox(room, [18, 0.2, 30], [0, 7, -8], darkMat);
+-
+-  // Subtle floor lighting strips
+-  const floorStripMat = new THREE.MeshBasicMaterial({
+-    color: "#31533c",
++  const screenMaterial = new THREE.ShaderMaterial({
++    vertexShader: SCREEN_VERT,
++    fragmentShader: SCREEN_FRAG,
+     toneMapped: false,
++    uniforms: {
++      uTerm: { value: terminal.texture },
++      uDig: { value: rt.texture },
++      uMix: { value: 0 },
++      uTime: { value: 0 },
++    },
+   });
+ 
+-  addBox(room, [7, 0.025, 0.035], [0, 0.015, -1], floorStripMat);
+-  addBox(room, [7, 0.025, 0.035], [0, 0.015, -13], floorStripMat);
+-
+-  // =====================================
+-  // DOOR AND FRAME
+-  // =====================================
+-
+-  const doorFrame = new THREE.Group();
+-  doorFrame.position.set(0, 0, 1);
+-  room.add(doorFrame);
+-
+-  addBox(doorFrame, [0.18, 4.4, 0.3], [-1.65, 2.2, 0], metalMat);
+-  addBox(doorFrame, [0.18, 4.4, 0.3], [1.65, 2.2, 0], metalMat);
+-  addBox(doorFrame, [3.5, 0.18, 0.3], [0, 4.4, 0], metalMat);
+-
+-  const doorPivot = new THREE.Group();
+-  doorPivot.position.set(-1.52, 0, 1.05);
+-  room.add(doorPivot);
+-
+-  addBox(
+-    doorPivot,
+-    [3.05, 4.15, 0.14],
+-    [1.525, 2.075, 0],
+-    doorMat
++  const room = createRoom(screenMaterial);
++  const digital = createDigitalWorld();
++
++  const roomScene = new THREE.Scene();
++  roomScene.background = new THREE.Color("#030504");
++  roomScene.fog = new THREE.FogExp2("#030504", 0.045);
++  roomScene.add(room.group);
++
++  // Dim studio environment so metal and the polished floor have something to reflect
++  const pmrem = new THREE.PMREMGenerator(renderer);
++  const envScene = new THREE.Scene();
++  envScene.add(
++    new THREE.Mesh(
++      new THREE.BoxGeometry(12, 6, 14),
++      new THREE.MeshBasicMaterial({ color: "#040706", side: THREE.BackSide })
++    )
+   );
+-
+-  // Recessed door panels
+-  addBox(
+-    doorPivot,
+-    [2.55, 1.55, 0.035],
+-    [1.525, 3.05, 0.09],
+-    doorPanelMat
+-  );
+-
+-  addBox(
+-    doorPivot,
+-    [2.55, 1.25, 0.035],
+-    [1.525, 1.25, 0.09],
+-    doorPanelMat
+-  );
+-
+-  // Door handle
+-  const handle = new THREE.Mesh(
+-    new THREE.SphereGeometry(0.065, 16, 16),
+-    metalMat
+-  );
+-
+-  handle.position.set(2.7, 2.05, 0.14);
+-  doorPivot.add(handle);
+-
+-  // Hinges
+-  [0.6, 2.1, 3.6].forEach((y) => {
+-    addBox(
+-      doorPivot,
+-      [0.1, 0.25, 0.22],
+-      [0.05, y, 0],
+-      metalMat
++  const envPanel = (color: string, gain: number, w: number, h: number, pos: [number, number, number], rot: [number, number, number]) => {
++    const m = new THREE.Mesh(
++      new THREE.PlaneGeometry(w, h),
++      new THREE.MeshBasicMaterial({ color: new THREE.Color(color).multiplyScalar(gain), side: THREE.DoubleSide })
+     );
+-  });
+-
+-  // Muted green edge light
+-  const doorEdgeMat = new THREE.MeshBasicMaterial({
+-    color: "#42694e",
+-    toneMapped: false,
+-  });
+-
+-  addBox(doorFrame, [0.035, 3.9, 0.025], [-1.49, 2.1, 0.18], doorEdgeMat);
+-
+-  // =====================================
+-  // DESK
+-  // =====================================
+-
+-  const desk = new THREE.Group();
+-  desk.position.set(0, 0, -6.2);
+-  room.add(desk);
+-
+-  addBox(desk, [4.5, 0.16, 1.8], [0, 1.55, 0], darkMat);
+-
+-  [-1.9, 1.9].forEach((x) => {
+-    addBox(desk, [0.12, 1.5, 0.12], [x, 0.78, 0], metalMat);
+-  });
+-
+-  // =====================================
+-  // LAPTOP
+-  // =====================================
+-
+-  const laptop = new THREE.Group();
+-  laptop.position.set(0, 1.65, -0.3);
+-  desk.add(laptop);
+-
+-  // Keyboard base
+-  addBox(laptop, [1.9, 0.08, 1.25], [0, 0, 0], metalMat);
+-
+-  // Keyboard surface
+-  addBox(
+-    laptop,
+-    [1.65, 0.012, 0.72],
+-    [0, 0.048, 0.2],
+-    darkMat
++    m.position.set(...pos);
++    m.rotation.set(...rot);
++    envScene.add(m);
++  };
++  envPanel("#b4cbc2", 5, 5, 1.2, [0, 2.8, 0], [Math.PI / 2, 0, 0]);
++  envPanel("#2f8f6c", 3, 6, 0.6, [-5.9, 1.2, 0], [0, Math.PI / 2, 0]);
++  envPanel("#6f8f9a", 2, 3, 1.5, [5.9, 1.5, -2], [0, -Math.PI / 2, 0]);
++  const envTarget = pmrem.fromScene(envScene, 0.03);
++  roomScene.environment = envTarget.texture;
++  roomScene.environmentIntensity = 0.45;
++  disposeObject(envScene);
++  pmrem.dispose();
++
++  // ---------- Cameras ----------
++  const roomCam = new THREE.PerspectiveCamera(42, 1, 0.02, 40);
++  const digCam = new THREE.PerspectiveCamera(RT_FOV, SCREEN_ASPECT, 0.1, 900);
++
++  // ---------- Screen anchor (centre + outward normal) ----------
++  room.group.updateMatrixWorld(true);
++  const screenCenter = new THREE.Vector3();
++  room.screen.getWorldPosition(screenCenter);
++  const screenNormal = new THREE.Vector3(0, 0, 1)
++    .transformDirection(room.screen.matrixWorld)
++    .normalize();
++
++  // ---------- Walk path ----------
++  const walkCurve = new THREE.CatmullRomCurve3(
++    [
++      new THREE.Vector3(0.0, 1.5, 3.7),
++      new THREE.Vector3(0.0, 1.52, 2.0),
++      new THREE.Vector3(0.0, 1.52, 0.6),
++      new THREE.Vector3(-0.05, 1.5, -1.0),
++      new THREE.Vector3(-0.25, 1.38, -2.8),
++      new THREE.Vector3(screenCenter.x, 1.2, screenCenter.z + 1.85),
++    ],
++    false,
++    "centripetal"
+   );
+-
+-  // Keyboard keys
+-  const keyMat = new THREE.MeshBasicMaterial({
+-    color: "#31543d",
+-    toneMapped: false,
+-  });
+-
+-  for (let row = 0; row < 4; row++) {
+-    for (let col = 0; col < 13; col++) {
+-      addBox(
+-        laptop,
+-        [0.085, 0.012, 0.09],
+-        [-0.75 + col * 0.125, 0.058, -0.05 + row * 0.16],
+-        keyMat
+-      );
+-    }
+-  }
+-
+-  // Laptop screen frame
+-  addBox(
+-    laptop,
+-    [1.9, 1.25, 0.07],
+-    [0, 0.64, -0.57],
+-    darkMat
++  const lookCurve = new THREE.CatmullRomCurve3(
++    [
++      new THREE.Vector3(0, 1.1, 0),
++      new THREE.Vector3(0, 1.15, -2.0),
++      new THREE.Vector3(0, 1.2, -4.0),
++      new THREE.Vector3(-0.1, 1.1, -5.5),
++      new THREE.Vector3(-0.3, 1.0, -6.4),
++      screenCenter.clone(),
++    ],
++    false,
++    "centripetal"
+   );
+ 
+-  // =====================================
+-  // LAPTOP TERMINAL DISPLAY
+-  // =====================================
+-
+-  const codeCanvas = document.createElement("canvas");
+-  codeCanvas.width = 1024;
+-  codeCanvas.height = 640;
+-
+-  const ctx = codeCanvas.getContext("2d");
+-
+-  let terminalFrame = 0;
+-
+-  const terminalMessages = [
+-    "> INITIALIZING SECURE SESSION",
+-    "[OK] NETWORK MODULE LOADED",
+-    "[OK] ENCRYPTION LAYER ACTIVE",
+-    "const system = await connect();",
+-    "function authenticate(user) {",
+-    "  return verifyIdentity(user);",
+-    "}",
+-    "[INFO] SCANNING ENVIRONMENT...",
+-    "[OK] DATABASE CONNECTION",
+-    "[OK] ACCESS TOKEN VERIFIED",
+-    "const status = 'ONLINE';",
+-    "loadSystemModules();",
+-    "executeProcess();",
+-    "[OK] SYSTEM ACCESS GRANTED",
+-  ];
+-
+-  function drawTerminal() {
+-    if (!ctx) return;
+-
+-    ctx.fillStyle = "#050907";
+-    ctx.fillRect(0, 0, 1024, 640);
+-
+-    // Header
+-    ctx.fillStyle = "#0c1710";
+-    ctx.fillRect(0, 0, 1024, 58);
+-
+-    ctx.fillStyle = "#78a88a";
+-    ctx.font = "bold 24px monospace";
+-    ctx.fillText("SYSTEM BREACH PROTOCOL  //  v3.9", 30, 37);
+-
+-    ctx.fillStyle = "#547d62";
+-    ctx.font = "18px monospace";
+-    ctx.fillText("USER: NAVSETU_", 780, 37);
+-
+-    // Main terminal frame
+-    ctx.strokeStyle = "#31513b";
+-    ctx.lineWidth = 2;
+-    ctx.strokeRect(25, 78, 974, 520);
+-
+-    // Terminal section
+-    ctx.fillStyle = "#91b49a";
+-    ctx.font = "bold 22px monospace";
+-    ctx.fillText("SECURE TERMINAL", 50, 118);
+-
+-    ctx.fillStyle = "#527d61";
+-    ctx.font = "18px monospace";
+-    ctx.fillText("LIVE SYSTEM LOG", 50, 151);
+-
+-    // Scrolling terminal lines
+-    const offset = Math.floor(terminalFrame / 8);
+-
+-    ctx.font = "20px monospace";
+-
+-    for (let i = 0; i < 12; i++) {
+-      const message =
+-        terminalMessages[(i + offset) % terminalMessages.length];
+-
+-      ctx.fillStyle = i % 3 === 0 ? "#91b49a" : "#5e9870";
+-      ctx.fillText(message, 52, 205 + i * 29);
+-    }
+-
+-    // Right-side data panel
+-    ctx.strokeStyle = "#31513b";
+-    ctx.strokeRect(720, 170, 245, 160);
+-
+-    ctx.fillStyle = "#78a88a";
+-    ctx.font = "bold 17px monospace";
+-    ctx.fillText("NETWORK STATUS", 740, 199);
+-
+-    ctx.fillStyle = "#527d61";
+-    ctx.font = "16px monospace";
+-    ctx.fillText("PING: 024ms", 740, 235);
+-    ctx.fillText("ENCRYPTION: AES", 740, 263);
+-    ctx.fillText("CONNECTION: SAFE", 740, 291);
+-
+-    // Small waveform
+-    ctx.beginPath();
+-    ctx.strokeStyle = "#659b75";
+-    ctx.lineWidth = 2;
+-
+-    for (let i = 0; i < 190; i++) {
+-      const x = 745 + i;
+-      const y =
+-        405 +
+-        Math.sin((i + terminalFrame * 2) * 0.12) * 12 +
+-        Math.sin(i * 0.31) * 5;
+-
+-      if (i === 0) ctx.moveTo(x, y);
+-      else ctx.lineTo(x, y);
+-    }
+-
+-    ctx.stroke();
+-
+-    // Bottom status bar
+-    ctx.fillStyle = "#14241a";
+-    ctx.fillRect(50, 550, 910, 18);
+-
+-    ctx.fillStyle = "#5e9870";
+-    ctx.fillRect(50, 550, 910 * ((terminalFrame % 180) / 180), 18);
++  const state: JourneyState = {
++    door: 0, walk: 0, approach: 0, mix: 0, depthPre: 0, depthMain: 0,
++  };
+ 
+-    // Blinking cursor
+-    if (Math.floor(terminalFrame / 25) % 2 === 0) {
+-      ctx.fillStyle = "#a0c4a8";
+-      ctx.fillRect(52, 590, 13, 22);
++  const camPos = new THREE.Vector3();
++  const lookAt = new THREE.Vector3();
++  const pEnd = new THREE.Vector3();
++  const tmp = new THREE.Vector3();
++
++  function poseRoomCamera() {
++    const w = THREE.MathUtils.clamp(state.walk, 0, 1);
++    walkCurve.getPoint(w, camPos);
++    lookCurve.getPoint(w, lookAt);
++
++    if (state.approach > 0) {
++      const e = THREE.MathUtils.clamp(state.approach, 0, 1);
++      const t = Math.tan(rad(roomCam.fov / 2));
++      const dFill =
++        0.985 * Math.min(SCREEN_W / (2 * t * roomCam.aspect), SCREEN_H / (2 * t));
++      pEnd.copy(screenCenter).addScaledVector(screenNormal, dFill);
++      camPos.lerp(pEnd, e);
++      camPos.y += Math.sin(Math.PI * e) * 0.02;
++      lookAt.lerp(screenCenter, e);
+     }
+-
+-    terminalFrame++;
+-    codeTexture.needsUpdate = true;
++    // On wide screens, frame the door right of centre so the hero copy
++    // (left aligned) doesn't sit on top of it; eases out as we walk in.
++    const shift = THREE.MathUtils.clamp((roomCam.aspect - 1.15) * 1.2, 0, 0.85);
++    lookAt.x -= shift * (1 - smoothstep(0, 0.22, w)) * (1 - state.approach);
++    roomCam.position.copy(camPos);
++    roomCam.lookAt(lookAt);
+   }
+ 
+-  const codeTexture = new THREE.CanvasTexture(codeCanvas);
+-  codeTexture.colorSpace = THREE.SRGBColorSpace;
+-
+-  const codeScreen = new THREE.Mesh(
+-    new THREE.PlaneGeometry(1.76, 1.1),
+-    new THREE.MeshBasicMaterial({
+-      map: codeTexture,
+-      toneMapped: false,
+-    })
+-  );
+-
+-  codeScreen.position.set(0, 0.65, -0.505);
+-  laptop.add(codeScreen);
+-
+-  drawTerminal();
+-
+-  // =====================================
+-  // DEVELOPER SILHOUETTE
+-  // =====================================
+-
+-  const developer = new THREE.Group();
+-  developer.position.set(0, 0, -7.7);
+-  room.add(developer);
+-
+-  addBox(developer, [1.3, 0.16, 1.2], [0, 1.05, 0.5], darkMat);
+-  addBox(developer, [1.3, 1.8, 0.16], [0, 1.95, 1.05], darkMat);
+-
+-  const body = new THREE.Mesh(
+-    new THREE.CapsuleGeometry(0.48, 0.95, 5, 12),
+-    silhouetteMat
+-  );
+-
+-  body.position.set(0, 2.05, 0.25);
+-  body.rotation.x = -0.18;
+-  developer.add(body);
+-
+-  const head = new THREE.Mesh(
+-    new THREE.SphereGeometry(0.31, 20, 20),
+-    silhouetteMat
+-  );
+-
+-  head.position.set(0, 3.05, -0.18);
+-  developer.add(head);
+-
+-  const armGeometry = new THREE.CapsuleGeometry(0.12, 0.8, 4, 8);
+-
+-  [-1, 1].forEach((side) => {
+-    const arm = new THREE.Mesh(armGeometry, silhouetteMat);
+-    arm.position.set(side * 0.52, 2.15, -0.25);
+-    arm.rotation.z = side * -0.6;
+-    developer.add(arm);
+-  });
+-
+-  // =====================================
+-  // DIGITAL WORLD - HIDDEN BEHIND SCREEN
+-  // =====================================
+-
+-  const digitalWorld = new THREE.Group();
+-  digitalWorld.visible = false;
+-  scene.add(digitalWorld);
+-
+-  // Tunnel floor
+-  const digitalFloor = new THREE.Mesh(
+-    new THREE.PlaneGeometry(18, 55),
+-    new THREE.MeshBasicMaterial({
+-      color: "#050a07",
+-      side: THREE.DoubleSide,
+-    })
+-  );
+-
+-  digitalFloor.rotation.x = -Math.PI / 2;
+-  digitalFloor.position.set(0, -1, -34);
+-  digitalWorld.add(digitalFloor);
+-
+-  // Tunnel grid
+-  const gridMaterial = new THREE.LineBasicMaterial({
+-    color: "#28563a",
+-    transparent: true,
+-    opacity: 0.32,
+-  });
+-
+-  const brightGridMaterial = new THREE.LineBasicMaterial({
+-    color: "#527d61",
+-    transparent: true,
+-    opacity: 0.5,
+-  });
+-
+-  for (let i = 0; i <= 30; i++) {
+-    const z = -9 - i * 1.5;
+-
+-    addLine(
+-      digitalWorld,
+-      [
+-        new THREE.Vector3(-9, -0.95, z),
+-        new THREE.Vector3(9, -0.95, z),
+-      ],
+-      i % 4 === 0 ? "#527d61" : "#28563a",
+-      i % 4 === 0 ? 0.45 : 0.22
+-    );
++  function poseDigitalCamera(depth: number) {
++    const sway = smoothstep(0, 60, depth);
++    const x = Math.sin(depth * 0.021) * 0.7 * sway;
++    const y = 0.4 + Math.sin(depth * 0.015 + 1) * 0.3 * sway;
++    digCam.position.set(x, y, -depth);
++    tmp.set(x * 0.4, 0.4 + (y - 0.4) * 0.5, -depth - 30);
++    digCam.up.set(0, 1, 0);
++    digCam.lookAt(tmp);
++    digCam.rotateZ(Math.sin(depth * 0.01) * 0.035 * sway);
+   }
+ 
+-  for (let i = 0; i <= 24; i++) {
+-    const x = -9 + i * 0.75;
+-
+-    addLine(
+-      digitalWorld,
+-      [
+-        new THREE.Vector3(x, -0.95, -9),
+-        new THREE.Vector3(x, -0.95, -55),
+-      ],
+-      i % 4 === 0 ? "#527d61" : "#28563a",
+-      i % 4 === 0 ? 0.4 : 0.18
++  /** Vertical FOV for the full-screen digital camera: matches what the
++   *  screen showed at the moment of hand-off, then opens up gradually. */
++  function directFov(depth: number, aspect: number) {
++    const matched = deg(
++      2 * Math.atan(Math.tan(rad(RT_FOV / 2)) * Math.min(1, SCREEN_ASPECT / aspect))
+     );
++    const target = aspect < 1 ? 72 : 64;
++    return THREE.MathUtils.lerp(matched, target, smoothstep(DEPTH_PRE_MAX, 70, depth));
+   }
+ 
+-  // Floating code panels - kept inside the tunnel
+-  const terminalPanels: THREE.Mesh[] = [];
+-
+-  const panelTexts = [
+-    "NETWORK / SECURE",
+-    "AUTHENTICATION OK",
+-    "DATA STREAM ACTIVE",
+-    "SYSTEM ACCESS GRANTED",
+-    "ENCRYPTION ENABLED",
+-    "PROCESS RUNNING",
+-  ];
+-
+-  panelTexts.forEach((message, index) => {
+-    const canvas = document.createElement("canvas");
+-    canvas.width = 640;
+-    canvas.height = 240;
+-
+-    const context = canvas.getContext("2d");
+-    if (!context) return;
+-
+-    context.fillStyle = "rgba(5, 12, 8, 0.96)";
+-    context.fillRect(0, 0, 640, 240);
+-
+-    context.strokeStyle = "#355d40";
+-    context.lineWidth = 3;
+-    context.strokeRect(3, 3, 634, 234);
+-
+-    context.fillStyle = "#91b49a";
+-    context.font = "bold 27px monospace";
+-    context.fillText("SYSTEM / TERMINAL", 25, 52);
+-
+-    context.fillStyle = "#659b75";
+-    context.font = "23px monospace";
+-    context.fillText("> " + message, 25, 110);
+-
+-    context.fillStyle = "#527d61";
+-    context.font = "19px monospace";
+-    context.fillText("STATUS: ACTIVE  //  0" + (index + 1), 25, 165);
+-
+-    const texture = new THREE.CanvasTexture(canvas);
+-    texture.colorSpace = THREE.SRGBColorSpace;
+-
+-    const panel = new THREE.Mesh(
+-      new THREE.PlaneGeometry(2.6, 0.98),
+-      new THREE.MeshBasicMaterial({
+-        map: texture,
+-        transparent: true,
+-        toneMapped: false,
+-      })
+-    );
+-
+-    const side = index % 2 === 0 ? -1 : 1;
+-
+-    panel.position.set(
+-      side * 3.4,
+-      1.5 + (index % 3) * 0.7,
+-      -15 - index * 5
+-    );
+-
+-    panel.rotation.y = side * -0.18;
+-
+-    digitalWorld.add(panel);
+-    terminalPanels.push(panel);
+-  });
+-
+-  // Data nodes
+-  const dataNodes: THREE.Mesh[] = [];
+-
+-  const nodeGeometry = new THREE.SphereGeometry(0.025, 8, 8);
+-  const nodeMaterial = new THREE.MeshBasicMaterial({
+-    color: "#6c9b78",
+-    toneMapped: false,
+-  });
+-
+-  for (let i = 0; i < 85; i++) {
+-    const node = new THREE.Mesh(nodeGeometry, nodeMaterial);
+-
+-    node.position.set(
+-      (Math.random() - 0.5) * 12,
+-      Math.random() * 5,
+-      -12 - Math.random() * 42
+-    );
+-
+-    digitalWorld.add(node);
+-    dataNodes.push(node);
++  // ---------- Resize ----------
++  function resize() {
++    const { w, h } = size();
++    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
++    renderer.setSize(w, h, false);
++    canvas.style.width = "100%";
++    canvas.style.height = "100%";
++    const aspect = w / h;
++    roomCam.aspect = aspect;
++    roomCam.fov =
++      aspect >= 1.2
++        ? 42
++        : Math.min(72, deg(2 * Math.atan(Math.tan(rad(21)) * (1.2 / aspect))));
++    roomCam.updateProjectionMatrix();
+   }
+ 
+-  // Distant focal point
+-  const portalCore = new THREE.Mesh(
+-    new THREE.IcosahedronGeometry(1.1, 2),
+-    new THREE.MeshBasicMaterial({
+-      color: "#315d40",
+-      wireframe: true,
+-      toneMapped: false,
+-    })
+-  );
+-
+-  portalCore.position.set(0, 2.2, -52);
+-  digitalWorld.add(portalCore);
++  // ---------- Render ----------
++  let lastTerminal = -1;
++  let renderedOnce = false;
+ 
+-  // =====================================
+-  // LIGHTING
+-  // =====================================
+-
+-  scene.add(new THREE.AmbientLight("#84918a", 0.22));
+-
+-  const roomLight = new THREE.PointLight("#557b65", 9, 13);
+-  roomLight.position.set(0, 4.5, -7);
+-  room.add(roomLight);
+-
+-  const screenLight = new THREE.PointLight("#4b9b69", 5, 6);
+-  screenLight.position.set(0, 2.8, -5.5);
+-  room.add(screenLight);
+-
+-  const hallwayLight = new THREE.PointLight("#87968d", 12, 15);
+-  hallwayLight.position.set(-1, 4.5, 4);
+-  room.add(hallwayLight);
++  function isDirect() {
++    return state.approach >= 0.999 && state.mix >= 0.999;
++  }
+ 
+-  const doorLight = new THREE.PointLight("#54785e", 8, 9);
+-  doorLight.position.set(0, 2.5, 2.5);
+-  room.add(doorLight);
++  function render(time: number) {
++    const { w, h } = size();
++    const pr = renderer.getPixelRatio();
++
++    if (isDirect()) {
++      // The screen now fills the viewport: render the digital world on its own.
++      const depth = state.depthPre + state.depthMain;
++      digital.update(time);
++      digital.setViewportHeight(h * pr);
++      digCam.aspect = w / h;
++      digCam.fov = directFov(depth, digCam.aspect);
++      digCam.updateProjectionMatrix();
++      poseDigitalCamera(depth);
++      renderer.render(digital.scene, digCam);
++      renderedOnce = true;
++      return;
++    }
+ 
+-  const digitalLight = new THREE.PointLight("#41694d", 12, 35);
+-  digitalLight.position.set(0, 3, -25);
+-  digitalWorld.add(digitalLight);
++    room.setDoor(state.door);
++    room.update(time);
++    screenMaterial.uniforms.uMix.value = state.mix;
++    screenMaterial.uniforms.uTime.value = time;
+ 
+-  // =====================================
+-  // RESIZE
+-  // =====================================
++    // The terminal is only visible once the door has started to open.
++    if ((state.door > 0.02 || !renderedOnce) && time - lastTerminal > 0.07) {
++      lastTerminal = time;
++      terminal.draw(time);
++    }
+ 
+-  function resize() {
+-    camera.aspect = window.innerWidth / window.innerHeight;
+-    camera.updateProjectionMatrix();
++    if (state.mix > 0.001) {
++      digital.update(time);
++      digital.setViewportHeight(RT_H);
++      digCam.aspect = SCREEN_ASPECT;
++      digCam.fov = RT_FOV;
++      digCam.updateProjectionMatrix();
++      poseDigitalCamera(state.depthPre);
++      renderer.setRenderTarget(rt);
++      renderer.render(digital.scene, digCam);
++      renderer.setRenderTarget(null);
++    }
+ 
+-    renderer.setSize(window.innerWidth, window.innerHeight);
+-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
++    poseRoomCamera();
++    renderer.render(roomScene, roomCam);
++    renderedOnce = true;
+   }
+ 
+-  // =====================================
+-  // ANIMATION AND CLEANUP
+-  // =====================================
+-
+-  function update() {
+-    drawTerminal();
+-
+-    portalCore.rotation.x += 0.001;
+-    portalCore.rotation.y += 0.002;
+-
+-    renderer.render(scene, camera);
+-  }
++  resize();
++  render(0);
+ 
+   function dispose() {
+-    scene.traverse((object) => {
+-      if (
+-        object instanceof THREE.Mesh ||
+-        object instanceof THREE.Line
+-      ) {
+-        object.geometry.dispose();
+-
+-        const materials = Array.isArray(object.material)
+-          ? object.material
+-          : [object.material];
+-
+-        materials.forEach((material) => {
+-          Object.values(material).forEach((value) => {
+-            if (value instanceof THREE.Texture) {
+-              value.dispose();
+-            }
+-          });
+-
+-          material.dispose();
+-        });
+-      }
+-    });
+-
++    disposeObject(roomScene);
++    digital.dispose();
++    terminal.dispose();
++    screenMaterial.dispose();
++    rt.dispose();
++    envTarget.dispose();
+     renderer.dispose();
+-    renderer.domElement.remove();
++    renderer.forceContextLoss();
++    canvas.remove();
+   }
+ 
+-  renderer.render(scene, camera);
+-
+-  return {
+-    scene,
+-    camera,
+-    renderer,
+-    room,
+-    doorPivot,
+-    laptop,
+-    developer,
+-    digitalWorld,
+-    terminalPanels,
+-    dataNodes,
+-    resize,
+-    update,
+-    dispose,
+-  };
++  return { state, domElement: canvas, resize, render, dispose };
+ }
+ 
++export type World = ReturnType<typeof createScene>;
+diff --git a/src/app/components/BeyondTheScreen/terminal.ts b/src/app/components/BeyondTheScreen/terminal.ts
+new file mode 100644
+index 0000000..3f23234
+--- /dev/null
++++ b/src/app/components/BeyondTheScreen/terminal.ts
+@@ -0,0 +1,461 @@
++import * as THREE from "three";
++import { makeCanvas } from "./util";
++
++/**
++ * Animated hacker terminal drawn on a 2D canvas that is used as the laptop
++ * screen texture. Layout is authored in a 1120x700 design space.
++ */
++
++const W = 1120;
++const H = 700;
++const SCALE = 1.6; // canvas is 1792 x 1120 (16:10)
++
++const FONT =
++  "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace";
++
++const C = {
++  bg: "#030806",
++  panel: "#06100c",
++  edge: "#17352a",
++  dim: "#3f6b57",
++  text: "#86b9a0",
++  hi: "#a9d6bd",
++  teal: "#3d9e98",
++  amber: "#a8956a",
++  red: "#a86565",
++  green: "#4fae80",
++};
++
++type Tok = [string, "k" | "t" | "s" | "f" | "n" | "c" | "y"];
++
++const TOK_COLOR: Record<Tok[1], string> = {
++  k: "#5fb3a0",
++  t: "#8fb5a2",
++  s: "#b0a068",
++  f: "#7fcf9d",
++  n: "#6aa7c9",
++  c: "#4b6b5c",
++  y: "#6fbf9a",
++};
++
++const CODE: Tok[][] = [
++  [["import", "k"], [" { connect, verify } ", "t"], ["from", "k"], [' "@iei/core";', "s"]],
++  [],
++  [["const", "k"], [" gateway = ", "t"], ["await", "k"], [" connect", "f"], ["({", "t"]],
++  [["  host: ", "t"], ['"portal.iei-iste.nitte"', "s"], [",", "t"]],
++  [["  port: ", "t"], ["8443", "n"], [",", "t"]],
++  [["  tls: { cipher: ", "t"], ['"AES-256-GCM"', "s"], [" },", "t"]],
++  [["});", "t"]],
++  [],
++  [["// authenticate operator session", "c"]],
++  [["async function", "k"], [" ", "t"], ["authenticate", "f"], ["(token: ", "t"], ["string", "y"], [") {", "t"]],
++  [["  const", "k"], [" claims = ", "t"], ["await", "k"], [" verify", "f"], ["(token);", "t"]],
++  [["  if", "k"], [" (!claims.valid) ", "t"], ["throw", "k"], [" new ", "t"], ["Error", "y"], ["(", "t"], ['"denied"', "s"], [");", "t"]],
++  [["  return", "k"], [" gateway.", "t"], ["open", "f"], ["(claims.scope);", "t"]],
++  [["}", "t"]],
++  [],
++  [["await", "k"], [" authenticate", "f"], ["(process.env.", "t"], ["TOKEN", "n"], [");", "t"]],
++  [["gateway.", "t"], ["stream", "f"], ["({ mode: ", "t"], ['"deep"', "s"], [" });", "t"]],
++];
++
++const CODE_TOTAL = CODE.reduce(
++  (sum, line) => sum + line.reduce((s, tok) => s + tok[0].length, 0) + 1,
++  0
++);
++
++const LOG: [string, string][] = [
++  ["INFO", "tls handshake complete peer=10.8.0.14"],
++  ["OK", "aes-256-gcm session key rotated"],
++  ["INFO", "resolve gateway.iei-iste.local"],
++  ["WARN", "upstream timeout 412ms, retry 2/5"],
++  ["OK", "firewall ruleset 4417 applied"],
++  ["INFO", "spawn worker pool size=8"],
++  ["OK", "token verified sub=navsetu scope=root"],
++  ["INFO", "sync shard 07 -> 12 (2.4 GB)"],
++  ["DBG", "heap 412MB gc pause 3.1ms"],
++  ["OK", "integrity check sha256 passed"],
++  ["INFO", "capture eth0 1.2k pps"],
++  ["INFO", "route table updated +3 -1"],
++  ["OK", "ids signature db up to date"],
++  ["WARN", "port scan blocked 203.0.113.9"],
++];
++
++const LEVEL_COLOR: Record<string, string> = {
++  INFO: C.teal,
++  OK: C.green,
++  WARN: C.amber,
++  DBG: C.dim,
++};
++
++const GLOBE_NODES: [number, number][] = [
++  [0.2, 0.4], [0.7, 1.4], [-0.3, 2.2], [0.1, 3.4], [-0.6, 4.4],
++  [0.5, 5.4], [-0.1, 0.0], [0.9, 2.9], [-0.8, 1.0],
++];
++
++export function createTerminal() {
++  const { canvas, ctx } = makeCanvas(W * SCALE, H * SCALE);
++
++  const texture = new THREE.CanvasTexture(canvas);
++  texture.colorSpace = THREE.SRGBColorSpace;
++  texture.generateMipmaps = true;
++  texture.minFilter = THREE.LinearMipmapLinearFilter;
++
++  const startSeconds = 21 * 3600 + 14 * 60 + 7;
++
++  function text(
++    s: string,
++    x: number,
++    y: number,
++    color: string,
++    size = 11,
++    bold = false
++  ) {
++    ctx.font = `${bold ? "bold " : ""}${size}px ${FONT}`;
++    ctx.fillStyle = color;
++    ctx.fillText(s, x, y);
++  }
++
++  function panel(x: number, y: number, w: number, h: number, title: string) {
++    ctx.fillStyle = C.panel;
++    ctx.fillRect(x, y, w, h);
++    ctx.strokeStyle = C.edge;
++    ctx.lineWidth = 1;
++    ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
++    ctx.fillStyle = "#0a1a13";
++    ctx.fillRect(x + 1, y + 1, w - 2, 18);
++    text(title, x + 8, y + 13.5, C.hi, 10, true);
++  }
++
++  function bar(x: number, y: number, w: number, h: number, v: number, color: string) {
++    ctx.fillStyle = "#0b1d15";
++    ctx.fillRect(x, y, w, h);
++    ctx.fillStyle = color;
++    ctx.fillRect(x, y, Math.max(0, Math.min(1, v)) * w, h);
++  }
++
++  function spark(
++    x: number, y: number, w: number, h: number,
++    t: number, seed: number, speed: number, color: string, fill = true
++  ) {
++    const n = 54;
++    ctx.beginPath();
++    for (let i = 0; i < n; i++) {
++      const v =
++        0.5 +
++        0.28 * Math.sin(i * 0.32 + t * speed + seed) +
++        0.14 * Math.sin(i * 0.93 - t * speed * 1.7 + seed * 3);
++      const px = x + (i / (n - 1)) * w;
++      const py = y + h - v * h;
++      if (i === 0) ctx.moveTo(px, py);
++      else ctx.lineTo(px, py);
++    }
++    ctx.strokeStyle = color;
++    ctx.lineWidth = 1.4;
++    ctx.stroke();
++    if (fill) {
++      ctx.lineTo(x + w, y + h);
++      ctx.lineTo(x, y + h);
++      ctx.closePath();
++      ctx.globalAlpha = 0.12;
++      ctx.fillStyle = color;
++      ctx.fill();
++      ctx.globalAlpha = 1;
++    }
++  }
++
++  function globe(cx: number, cy: number, R: number, t: number) {
++    const a = t * 0.35;
++    const tilt = 0.42;
++    const proj = (lat: number, lon: number): [number, number, number] => {
++      const cl = Math.cos(lat);
++      const x = cl * Math.sin(lon + a);
++      const y = Math.sin(lat);
++      const z = cl * Math.cos(lon + a);
++      const y2 = y * Math.cos(tilt) - z * Math.sin(tilt);
++      const z2 = y * Math.sin(tilt) + z * Math.cos(tilt);
++      return [cx + R * x, cy - R * y2, z2];
++    };
++
++    const front = new Path2D();
++    const back = new Path2D();
++    const addLine = (pts: [number, number, number][]) => {
++      for (let i = 0; i < pts.length - 1; i++) {
++        const p0 = pts[i];
++        const p1 = pts[i + 1];
++        const path = (p0[2] + p1[2]) / 2 > 0 ? front : back;
++        path.moveTo(p0[0], p0[1]);
++        path.lineTo(p1[0], p1[1]);
++      }
++    };
++
++    for (let lon = 0; lon < 360; lon += 30) {
++      const pts: [number, number, number][] = [];
++      for (let lat = -90; lat <= 90; lat += 10) {
++        pts.push(proj((lat * Math.PI) / 180, (lon * Math.PI) / 180));
++      }
++      addLine(pts);
++    }
++    for (let lat = -60; lat <= 60; lat += 30) {
++      const pts: [number, number, number][] = [];
++      for (let lon = 0; lon <= 360; lon += 10) {
++        pts.push(proj((lat * Math.PI) / 180, (lon * Math.PI) / 180));
++      }
++      addLine(pts);
++    }
++
++    ctx.lineWidth = 0.8;
++    ctx.strokeStyle = "rgba(61,158,152,0.16)";
++    ctx.stroke(back);
++    ctx.strokeStyle = "rgba(95,179,160,0.7)";
++    ctx.stroke(front);
++
++    const projected = GLOBE_NODES.map(([la, lo]) => proj(la, lo));
++    ctx.strokeStyle = "rgba(169,214,189,0.4)";
++    [[0, 3], [1, 5], [2, 7], [4, 8]].forEach(([i, j]) => {
++      const p = projected[i];
++      const q = projected[j];
++      if (p[2] > 0 && q[2] > 0) {
++        ctx.beginPath();
++        ctx.moveTo(p[0], p[1]);
++        ctx.quadraticCurveTo(
++          (p[0] + q[0]) / 2,
++          (p[1] + q[1]) / 2 - R * 0.35,
++          q[0],
++          q[1]
++        );
++        ctx.stroke();
++      }
++    });
++    projected.forEach((p, i) => {
++      if (p[2] <= 0) return;
++      const pulse = 0.5 + 0.5 * Math.sin(t * 2 + i);
++      ctx.fillStyle = C.hi;
++      ctx.fillRect(p[0] - 1.5, p[1] - 1.5, 3, 3);
++      ctx.strokeStyle = `rgba(127,207,157,${0.5 * pulse})`;
++      ctx.beginPath();
++      ctx.arc(p[0], p[1], 3 + pulse * 4, 0, Math.PI * 2);
++      ctx.stroke();
++    });
++
++    ctx.strokeStyle = "rgba(95,179,160,0.5)";
++    ctx.beginPath();
++    ctx.arc(cx, cy, R, 0, Math.PI * 2);
++    ctx.stroke();
++  }
++
++  function draw(t: number) {
++    ctx.setTransform(SCALE, 0, 0, SCALE, 0, 0);
++    ctx.textBaseline = "alphabetic";
++
++    ctx.fillStyle = C.bg;
++    ctx.fillRect(0, 0, W, H);
++
++    // ---------- Title bar ----------
++    ctx.fillStyle = "#071410";
++    ctx.fillRect(0, 0, W, 34);
++    ["#a86565", "#a8956a", "#4fae80"].forEach((col, i) => {
++      ctx.fillStyle = col;
++      ctx.globalAlpha = 0.8;
++      ctx.beginPath();
++      ctx.arc(20 + i * 18, 17, 5, 0, Math.PI * 2);
++      ctx.fill();
++      ctx.globalAlpha = 1;
++    });
++    text("navsetu@iei-iste: ~/gateway  -  secure shell", 90, 21, C.text, 12);
++    const sec = Math.floor(startSeconds + t);
++    const hh = String(Math.floor(sec / 3600) % 24).padStart(2, "0");
++    const mm = String(Math.floor(sec / 60) % 60).padStart(2, "0");
++    const ss = String(sec % 60).padStart(2, "0");
++    text(`${hh}:${mm}:${ss}  UTC+5:30`, 860, 21, C.dim, 12);
++    ctx.fillStyle = C.green;
++    ctx.beginPath();
++    ctx.arc(1096, 17, 3.5, 0, Math.PI * 2);
++    ctx.fill();
++
++    // ---------- Left: system log ----------
++    panel(14, 44, 346, 590, "SYSTEM LOG  /var/log/gateway.log");
++    ctx.save();
++    ctx.beginPath();
++    ctx.rect(15, 64, 344, 568);
++    ctx.clip();
++    const rate = 2.4;
++    const head = t * rate;
++    const headIdx = Math.floor(head);
++    const frac = head - headIdx;
++    const rows = 38;
++    const lineH = 14.6;
++    for (let r = 0; r < rows + 1; r++) {
++      const n = headIdx - (rows - r);
++      const h = ((n * 2654435761) >>> 0) % LOG.length;
++      const [lvl, msg] = LOG[h];
++      const s2 = (startSeconds + Math.floor(n * 0.42)) % 86400;
++      const stamp = `${String(Math.floor(s2 / 3600)).padStart(2, "0")}:${String(
++        Math.floor(s2 / 60) % 60
++      ).padStart(2, "0")}:${String(s2 % 60).padStart(2, "0")}`;
++      const y = 78 + r * lineH - frac * lineH;
++      const alpha = Math.min(1, 0.25 + (r / rows) * 0.9);
++      ctx.globalAlpha = alpha;
++      text(stamp, 22, y, C.dim, 10);
++      text(lvl.padEnd(4), 76, y, LEVEL_COLOR[lvl], 10, true);
++      text(msg, 106, y, C.text, 10);
++    }
++    ctx.globalAlpha = 1;
++    ctx.restore();
++
++    // ---------- Centre: code editor ----------
++    panel(372, 44, 388, 286, "gateway.ts");
++    ctx.fillStyle = "#08150f";
++    ctx.fillRect(373, 63, 386, 16);
++    text("gateway.ts", 380, 75, C.hi, 10);
++    text("auth.ts", 450, 75, C.dim, 10);
++    text("stream.ts", 506, 75, C.dim, 10);
++
++    ctx.font = `11px ${FONT}`;
++    const cw = ctx.measureText("M").width;
++    const cycle = CODE_TOTAL + 70;
++    const reveal = Math.floor((t * 22) % cycle);
++    let remaining = Math.min(reveal, CODE_TOTAL);
++    let cursorX = 408;
++    let cursorY = 96;
++    for (let i = 0; i < CODE.length; i++) {
++      const y = 96 + i * 13.4;
++      text(String(i + 1).padStart(2, " "), 380, y, "#2b4a3b", 10);
++      let x = 408;
++      for (const [str, kind] of CODE[i]) {
++        if (remaining <= 0) break;
++        const part = str.slice(0, remaining);
++        text(part, x, y, TOK_COLOR[kind], 11);
++        x += part.length * cw;
++        remaining -= part.length;
++      }
++      cursorX = x;
++      cursorY = y;
++      if (remaining <= 0) break;
++      remaining -= 1;
++    }
++    if (Math.floor(t * 2.2) % 2 === 0) {
++      ctx.fillStyle = C.hi;
++      ctx.fillRect(cursorX + 1, cursorY - 10, 6, 12);
++    }
++
++    // ---------- Centre: traffic chart ----------
++    panel(372, 338, 388, 130, "TRAFFIC ANALYSIS  eth0");
++    for (let i = 0; i < 4; i++) {
++      ctx.strokeStyle = "rgba(61,158,152,0.12)";
++      ctx.beginPath();
++      ctx.moveTo(380, 366 + i * 24);
++      ctx.lineTo(752, 366 + i * 24);
++      ctx.stroke();
++    }
++    spark(380, 360, 372, 98, t, 1.0, 1.1, C.green);
++    spark(380, 360, 372, 98, t, 4.2, 0.8, C.teal);
++    text("RX", 710, 380, C.green, 9, true);
++    text("TX", 730, 380, C.teal, 9, true);
++
++    // ---------- Centre: process table ----------
++    panel(372, 476, 388, 158, "PROCESS MONITOR");
++    text("PID", 382, 505, C.dim, 9);
++    text("NAME", 424, 505, C.dim, 9);
++    text("CPU", 600, 505, C.dim, 9);
++    text("MEM", 690, 505, C.dim, 9);
++    const procs = ["gatewayd", "tls-proxy", "ids-engine", "sync-agent", "key-vault", "logshipper"];
++    procs.forEach((name, i) => {
++      const y = 521 + i * 18;
++      const cpu = 0.3 + 0.3 * Math.sin(t * 0.9 + i * 1.7) + 0.1 * Math.sin(t * 2.3 + i);
++      text(String(1204 + i * 37), 382, y, C.text, 10);
++      text(name, 424, y, C.hi, 10);
++      bar(600, y - 8, 70, 7, cpu, i === 2 ? C.amber : C.green);
++      bar(690, y - 8, 56, 7, 0.25 + 0.1 * i, C.teal);
++    });
++
++    // ---------- Right: network status ----------
++    panel(772, 44, 334, 150, "NETWORK STATUS");
++    const lat = 22 + Math.round(6 * Math.sin(t * 1.3));
++    const pps = (14.2 + 0.8 * Math.sin(t * 0.7)).toFixed(1);
++    text("UPLINK", 782, 78, C.dim, 10);
++    text("ONLINE", 850, 78, C.green, 10, true);
++    text("LATENCY", 782, 96, C.dim, 10);
++    text(`${lat} ms`, 850, 96, C.hi, 10);
++    text("PACKETS", 782, 114, C.dim, 10);
++    text(`${pps}k/s`, 850, 114, C.hi, 10);
++    text("LOSS", 782, 132, C.dim, 10);
++    text("0.00 %", 850, 132, C.hi, 10);
++    spark(782, 142, 314, 42, t, 2.0, 1.4, C.teal);
++
++    // ---------- Right: encryption ----------
++    panel(772, 202, 334, 104, "ENCRYPTION STATUS");
++    text("CIPHER", 782, 236, C.dim, 10);
++    text("AES-256-GCM", 850, 236, C.hi, 10, true);
++    text("HANDSHAKE", 782, 254, C.dim, 10);
++    text("RSA-4096  verified", 850, 254, C.green, 10);
++    text("KEY ROTATION", 782, 276, C.dim, 10);
++    const rot = (t * 0.07) % 1;
++    bar(870, 268, 168, 8, rot, C.teal);
++    text(`${Math.floor(rot * 100)}%`, 1048, 276, C.hi, 10);
++    text("ENTROPY", 782, 294, C.dim, 10);
++    bar(870, 287, 168, 8, 0.92, C.green);
++    text("SECURE", 1048, 295, C.green, 10, true);
++
++    // ---------- Right: globe ----------
++    panel(772, 314, 334, 190, "GLOBAL NODES");
++    globe(862, 414, 68, t);
++    text("NODES", 958, 372, C.dim, 10);
++    text("128", 1030, 372, C.hi, 10, true);
++    text("ONLINE", 958, 390, C.dim, 10);
++    text("126", 1030, 390, C.green, 10, true);
++    text("REGIONS", 958, 408, C.dim, 10);
++    text("07", 1030, 408, C.hi, 10, true);
++    text("SYNC", 958, 426, C.dim, 10);
++    bar(958, 432, 130, 6, (t * 0.11) % 1, C.teal);
++    text("ROUTE", 958, 454, C.dim, 10);
++    text("BLR > SIN > FRA", 958, 468, C.text, 10);
++
++    // ---------- Right: monitoring ----------
++    panel(772, 512, 334, 122, "MONITORING");
++    for (let i = 0; i < 16; i++) {
++      const v = 0.3 + 0.3 * Math.sin(t * 1.2 + i * 0.7) + 0.2 * Math.sin(t * 2.1 + i * 1.9);
++      const bh = Math.max(4, v * 56);
++      ctx.fillStyle = i % 5 === 0 ? C.teal : C.green;
++      ctx.globalAlpha = 0.75;
++      ctx.fillRect(784 + i * 10, 580 - bh, 7, bh);
++      ctx.globalAlpha = 1;
++    }
++    text("CPU", 960, 548, C.dim, 10);
++    bar(990, 541, 100, 7, 0.42 + 0.1 * Math.sin(t), C.green);
++    text("MEM", 960, 568, C.dim, 10);
++    bar(990, 561, 100, 7, 0.61, C.teal);
++    text("DISK", 960, 588, C.dim, 10);
++    bar(990, 581, 100, 7, 0.34, C.green);
++    text("TEMP", 960, 608, C.dim, 10);
++    bar(990, 601, 100, 7, 0.48, C.amber);
++
++    // ---------- Footer prompt ----------
++    ctx.fillStyle = "#071410";
++    ctx.fillRect(0, 642, W, 58);
++    text("navsetu@iei-iste:~$", 16, 668, C.green, 12, true);
++    text("./gateway --secure --stream deep", 160, 668, C.hi, 12);
++    if (Math.floor(t * 2) % 2 === 0) {
++      ctx.fillStyle = C.hi;
++      ctx.fillRect(160 + 33 * 7.2 + 4, 656, 8, 14);
++    }
++    text("LOADING MODULES", 16, 690, C.dim, 10);
++    const prog = (t * 0.09) % 1;
++    bar(130, 682, 320, 8, prog, C.green);
++    text(`${Math.floor(prog * 100)}%`, 462, 690, C.hi, 10);
++    text("session 0x4F2A  |  uptime 14d 03h  |  load 0.42", 640, 690, C.dim, 10);
++
++    texture.needsUpdate = true;
++  }
++
++  draw(0);
++
++  return {
++    texture,
++    draw,
++    dispose() {
++      texture.dispose();
++    },
++  };
++}
++
++export const SCREEN_ASPECT = 1.6;
+diff --git a/src/app/components/BeyondTheScreen/util.ts b/src/app/components/BeyondTheScreen/util.ts
+new file mode 100644
+index 0000000..30c024b
+--- /dev/null
++++ b/src/app/components/BeyondTheScreen/util.ts
+@@ -0,0 +1,65 @@
++import * as THREE from "three";
++
++export function makeCanvas(width: number, height: number) {
++  const canvas = document.createElement("canvas");
++  canvas.width = width;
++  canvas.height = height;
++  const ctx = canvas.getContext("2d");
++  if (!ctx) throw new Error("2D canvas context unavailable");
++  return { canvas, ctx };
++}
++
++/** Deterministic PRNG so generated textures look identical on every load. */
++export function mulberry32(seed: number) {
++  let a = seed >>> 0;
++  return () => {
++    a = (a + 0x6d2b79f5) >>> 0;
++    let t = a;
++    t = Math.imul(t ^ (t >>> 15), t | 1);
++    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
++    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
++  };
++}
++
++export const smoothstep = (a: number, b: number, x: number) => {
++  const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
++  return t * t * (3 - 2 * t);
++};
++
++type Disposable = THREE.Mesh | THREE.Line | THREE.Points | THREE.Sprite;
++
++function disposeMaterial(material: THREE.Material) {
++  const record = material as unknown as Record<string, unknown>;
++  for (const value of Object.values(record)) {
++    if (value instanceof THREE.Texture) value.dispose();
++  }
++  const uniforms = (material as THREE.ShaderMaterial).uniforms;
++  if (uniforms) {
++    for (const uniform of Object.values(uniforms)) {
++      if (uniform.value instanceof THREE.Texture) uniform.value.dispose();
++    }
++  }
++  material.dispose();
++}
++
++/** Disposes every geometry, material and texture beneath `root`. */
++export function disposeObject(root: THREE.Object3D) {
++  const geometries = new Set<THREE.BufferGeometry>();
++  const materials = new Set<THREE.Material>();
++
++  root.traverse((object) => {
++    const item = object as Disposable;
++    if (item.geometry) geometries.add(item.geometry);
++    if (item.material) {
++      const list = Array.isArray(item.material)
++        ? item.material
++        : [item.material];
++      list.forEach((m) => materials.add(m));
++    }
++    const instanced = object as THREE.InstancedMesh;
++    if (instanced.isInstancedMesh) instanced.dispose();
++  });
++
++  geometries.forEach((g) => g.dispose());
++  materials.forEach(disposeMaterial);
++}
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 4c8abc4..3275646 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -1001,7 +1001,9 @@ main {
+   }
+ }
+ 
+-/* BEYOND THE SCREEN */
++/* =====================================
++   BEYOND THE SCREEN — cinematic 3D layer
++===================================== */
+ 
+ .beyond-screen-background {
+   position: fixed;
+@@ -1012,7 +1014,7 @@ main {
+   z-index: 0;
+   overflow: hidden;
+   pointer-events: none;
+-  background: #08090c;
++  background: #030504;
+ }
+ 
+ .beyond-screen-background canvas {
+@@ -1021,47 +1023,15 @@ main {
+   height: 100%;
+ }
+ 
+-.site-content {
+-  position: relative;
+-  z-index: 1;
+-}
+-
+-.hero,
+-.about-section,
+-.events-section,
+-.community-section,
+-.contact-section,
+-.footer {
+-  background-color: transparent !important;
+-}
+-/* Extra scroll space for the digital world transition */
+-.beyond-scroll-runway {
+-  position: relative;
+-  width: 100%;
+-  height: 220vh;
+-  pointer-events: none;
+-  background: transparent;
+-}
+-
+-/* =====================================
+-   FULLSCREEN 3D BACKGROUND
+-===================================== */
+-
+-.beyond-screen-background {
+-  position: fixed;
++/* Soft vignette keeps the page copy readable over the 3D scene */
++.beyond-screen-background::after {
++  content: "";
++  position: absolute;
+   inset: 0;
+-  width: 100%;
+-  height: 100vh;
+-  z-index: 0;
+-  overflow: hidden;
+   pointer-events: none;
+-  background: #050706;
+-}
+-
+-.beyond-screen-background canvas {
+-  display: block;
+-  width: 100%;
+-  height: 100%;
++  background:
++    linear-gradient(90deg, rgba(3, 5, 4, 0.4) 0%, rgba(3, 5, 4, 0.08) 55%, rgba(3, 5, 4, 0) 100%),
++    radial-gradient(ellipse at center, transparent 45%, rgba(3, 5, 4, 0.5) 100%);
+ }
+ 
+ .site-content {
+@@ -1069,19 +1039,16 @@ main {
+   z-index: 1;
+ }
+ 
+-/* Keep the website sections transparent */
+ .site-content section {
+   background: transparent;
+ }
+ 
+-/* =====================================
+-   EXTENDED DIGITAL JOURNEY
+-===================================== */
+-
++/* Extra scroll after the footer: enter the laptop and travel through the
++   digital world. Drives the second ScrollTrigger timeline. */
+ .beyond-scroll-runway {
+   position: relative;
+   width: 100%;
+-  height: 400vh;
++  height: 900vh;
+   pointer-events: none;
+   background: transparent;
+ }
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index 979fe92..e4f1ba1 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -284,16 +284,13 @@ export default function Home() {
+           © 2026 IEI × ISTE NITTE. All rights reserved.
+         </span>
+       </footer>
++
++      {/* Extra scroll distance: the camera enters the laptop and travels through the digital world */}
+       <section
+-  id="beyond-scroll-runway"
+-  className="beyond-scroll-runway"
+-  aria-label="Enter the digital world"
+-/>
++        id="beyond-scroll-runway"
++        className="beyond-scroll-runway"
++        aria-label="Enter the digital world"
++      />
+     </main>
+   );
+ }
+-<section
+-  id="beyond-scroll-runway"
+-  className="beyond-scroll-runway"
+-  aria-label="Enter the digital environment"
+-/>
+\ No newline at end of file
+-- 
+2.43.0
+

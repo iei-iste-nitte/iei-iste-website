@@ -1,0 +1,734 @@
+From ca193ce5b5ba7924ad38654d24222cd0795b31d5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 5 Nov 2026 09:18:03 +0000
+Subject: [PATCH 2/2] Make cinematic scroll experience mobile-responsive and
+ optimised
+
+- Quality profile: mobile DPR cap 1.25, 45% particle/panel/wireframe density,
+  no shadow maps, smaller/cheaper portal render target, slower terminal redraw
+- Adaptive fallback to 1x DPR + lighter scene if a phone sustains <33fps
+- Portrait camera framing (back off at the door, close in on the laptop);
+  zero effect on landscape/desktop
+- Idempotent resize via ResizeObserver + orientationchange; canvas sized in
+  lvh so the address bar never changes it; no scene recreation
+- prefers-reduced-motion: unscrubbed, render-on-change, frozen ambient motion
+- Touch-friendly hamburger nav, fixed navbar, hero-bottom overflow fix on phones
+- Full listener/loop/resource cleanup on unmount
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GduWwzosU2paBti3qSezKP
+---
+ .../BeyondTheScreen/BeyondTheScreen.tsx       | 123 ++++++++++----
+ src/app/components/BeyondTheScreen/digital.ts |  18 ++
+ src/app/components/BeyondTheScreen/room.ts    |   8 +-
+ src/app/components/BeyondTheScreen/scene.ts   | 160 ++++++++++++++++--
+ src/app/components/MobileNav.tsx              |  65 +++++++
+ src/app/globals.css                           | 113 ++++++++++++-
+ src/app/page.tsx                              |   3 +
+ 7 files changed, 432 insertions(+), 58 deletions(-)
+ create mode 100644 src/app/components/MobileNav.tsx
+
+diff --git a/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx b/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
+index be17a76..0b0b22f 100644
+--- a/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
++++ b/src/app/components/BeyondTheScreen/BeyondTheScreen.tsx
+@@ -6,6 +6,8 @@ import { ScrollTrigger } from "gsap/ScrollTrigger";
+ import { createScene, DEPTH_MAIN_MAX, DEPTH_PRE_MAX } from "./scene";
+ 
+ gsap.registerPlugin(ScrollTrigger);
++// Mobile browsers resize the viewport as the address bar slides in/out; this
++// stops that from re-measuring (and so jumping) the scrubbed timelines.
+ ScrollTrigger.config({ ignoreMobileResize: true });
+ 
+ /**
+@@ -19,6 +21,10 @@ ScrollTrigger.config({ ignoreMobileResize: true });
+  *
+  * Each timeline writes to its own fields on a shared state object; the render
+  * loop reads that state, so nothing ever fights over the camera.
++ *
++ * Nothing here touches scrolling itself (no scroll locking, no
++ * normalizeScroll, canvas is pointer-events: none), so native touch scrolling
++ * is preserved.
+  */
+ export default function BeyondTheScreen() {
+   const containerRef = useRef<HTMLDivElement>(null);
+@@ -42,54 +48,92 @@ export default function BeyondTheScreen() {
+ 
+     const runway = document.getElementById("beyond-scroll-runway");
+     const { state } = world;
++    const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
++
++    // Timelines are rebuilt only when the motion preference flips; the scene
++    // itself is never recreated.
++    const buildTimelines = (reduce: boolean) =>
++      gsap.context(() => {
++        // `true` = tie directly to scroll with no easing lag.
++        const scrub: boolean | number = reduce ? true : 0.8;
+ 
+-    const ctx = gsap.context(() => {
+-      const scrub = window.matchMedia("(prefers-reduced-motion: reduce)").matches
+-        ? 0.2
+-        : 0.8;
+-
+-      // Phase 1-4: door, walk in, approach the laptop (website content scroll)
+-      const roomTl = gsap.timeline({
+-        defaults: { ease: "none" },
+-        scrollTrigger: {
+-          trigger: document.documentElement,
+-          start: "top top",
+-          endTrigger: runway ?? document.body,
+-          end: runway ? "top bottom" : "bottom bottom",
+-          scrub,
+-          invalidateOnRefresh: true,
+-        },
+-      });
+-      roomTl
+-        .fromTo(state, { door: 0 }, { door: 1, duration: 1.8, ease: "power2.inOut", immediateRender: false }, 0)
+-        .fromTo(state, { walk: 0 }, { walk: 1, duration: 4.2, ease: "power1.inOut", immediateRender: false }, 1.6);
+-
+-      // Phase 5-6: enter the screen and travel through the digital world
+-      if (runway) {
+-        const digitalTl = gsap.timeline({
++        // Phase 1-4: door, walk in, approach the laptop (website content scroll)
++        const roomTl = gsap.timeline({
+           defaults: { ease: "none" },
+           scrollTrigger: {
+-            trigger: runway,
+-            start: "top bottom",
+-            end: "bottom bottom",
++            trigger: document.documentElement,
++            start: "top top",
++            endTrigger: runway ?? document.body,
++            end: runway ? "top bottom" : "bottom bottom",
+             scrub,
+             invalidateOnRefresh: true,
+           },
+         });
+-        digitalTl
+-          .fromTo(state, { approach: 0 }, { approach: 1, duration: 1.6, ease: "power2.inOut", immediateRender: false }, 0)
+-          .fromTo(state, { mix: 0 }, { mix: 1, duration: 1.0, ease: "power1.inOut", immediateRender: false }, 0.9)
+-          .fromTo(state, { depthPre: 0 }, { depthPre: DEPTH_PRE_MAX, duration: 1.9, immediateRender: false }, 0)
+-          .fromTo(state, { depthMain: 0 }, { depthMain: DEPTH_MAIN_MAX, duration: 8.1, ease: "power1.inOut", immediateRender: false }, 1.9);
+-      }
+-    }, container);
++        roomTl
++          .fromTo(state, { door: 0 }, { door: 1, duration: 1.8, ease: "power2.inOut", immediateRender: false }, 0)
++          .fromTo(state, { walk: 0 }, { walk: 1, duration: 4.2, ease: "power1.inOut", immediateRender: false }, 1.6);
++
++        // Phase 5-6: enter the screen and travel through the digital world
++        if (runway) {
++          const digitalTl = gsap.timeline({
++            defaults: { ease: "none" },
++            scrollTrigger: {
++              trigger: runway,
++              start: "top bottom",
++              end: "bottom bottom",
++              scrub,
++              invalidateOnRefresh: true,
++            },
++          });
++          digitalTl
++            .fromTo(state, { approach: 0 }, { approach: 1, duration: 1.6, ease: "power2.inOut", immediateRender: false }, 0)
++            .fromTo(state, { mix: 0 }, { mix: 1, duration: 1.0, ease: "power1.inOut", immediateRender: false }, 0.9)
++            .fromTo(state, { depthPre: 0 }, { depthPre: DEPTH_PRE_MAX, duration: 1.9, immediateRender: false }, 0)
++            .fromTo(state, { depthMain: 0 }, { depthMain: DEPTH_MAIN_MAX, duration: 8.1, ease: "power1.inOut", immediateRender: false }, 1.9);
++        }
++      }, container);
++
++    world.setReducedMotion(motionQuery.matches);
++    let ctx = buildTimelines(motionQuery.matches);
++
++    const onMotionChange = (event: MediaQueryListEvent) => {
++      world.setReducedMotion(event.matches);
++      ctx.revert();
++      ctx = buildTimelines(event.matches);
++      ScrollTrigger.refresh();
++    };
++    motionQuery.addEventListener("change", onMotionChange);
+ 
+     // Single render loop, shared with GSAP's ticker (pauses with the tab).
+     const tick = (time: number) => world.render(time);
+     gsap.ticker.add(tick);
+ 
+-    const onResize = () => world.resize();
+-    window.addEventListener("resize", onResize);
++    // Resize handling: coalesced into one call per frame, idempotent, and it
++    // never rebuilds the scene (see scene.resize / applyQuality).
++    let resizeRaf = 0;
++    const scheduleResize = () => {
++      cancelAnimationFrame(resizeRaf);
++      resizeRaf = requestAnimationFrame(() => world.resize());
++    };
++    window.addEventListener("resize", scheduleResize);
++
++    // iOS/Android report the new size a beat after `orientationchange`.
++    let orientationTimer = 0;
++    const onOrientation = () => {
++      scheduleResize();
++      window.clearTimeout(orientationTimer);
++      orientationTimer = window.setTimeout(() => {
++        world.resize();
++        ScrollTrigger.refresh();
++      }, 300);
++    };
++    window.addEventListener("orientationchange", onOrientation);
++
++    const observer =
++      typeof ResizeObserver !== "undefined"
++        ? new ResizeObserver(scheduleResize)
++        : null;
++    observer?.observe(container);
+ 
+     const refresh = () => ScrollTrigger.refresh();
+     const raf = requestAnimationFrame(refresh);
+@@ -100,8 +144,13 @@ export default function BeyondTheScreen() {
+ 
+     return () => {
+       cancelAnimationFrame(raf);
++      cancelAnimationFrame(resizeRaf);
++      window.clearTimeout(orientationTimer);
+       window.removeEventListener("load", refresh);
+-      window.removeEventListener("resize", onResize);
++      window.removeEventListener("resize", scheduleResize);
++      window.removeEventListener("orientationchange", onOrientation);
++      motionQuery.removeEventListener("change", onMotionChange);
++      observer?.disconnect();
+       gsap.ticker.remove(tick);
+       ctx.revert();
+       world.dispose();
+diff --git a/src/app/components/BeyondTheScreen/digital.ts b/src/app/components/BeyondTheScreen/digital.ts
+index 2e0cc2a..d72948d 100644
+--- a/src/app/components/BeyondTheScreen/digital.ts
++++ b/src/app/components/BeyondTheScreen/digital.ts
+@@ -390,9 +390,11 @@ export function createDigitalWorld() {
+       toneMapped: false,
+     });
+   const glyphMats = [makeGlyphMat(glyphA), makeGlyphMat(glyphB)];
++  const glyphPlanes: THREE.Mesh[] = [];
+   for (let i = 0; i < 12; i++) {
+     [-1, 1].forEach((side, s) => {
+       const m = new THREE.Mesh(glyphGeo, glyphMats[(i + s) % 2]);
++      glyphPlanes.push(m);
+       m.position.set(side * 5.93, 0.6, -14 - i * 29 - (s ? 14 : 0));
+       m.rotation.y = side < 0 ? Math.PI / 2 : -Math.PI / 2;
+       scene.add(m);
+@@ -487,6 +489,7 @@ export function createDigitalWorld() {
+   );
+ 
+   const PULSES = 56;
++  const PARTICLE_TOTAL = PARTICLES;
+   const pulseState = Array.from({ length: PULSES }, () => ({
+     edge: Math.floor(rand() * edges.length),
+     t: rand(),
+@@ -673,9 +676,24 @@ export function createDigitalWorld() {
+     pulseGeo.attributes.position.needsUpdate = true;
+   }
+ 
++  /**
++   * Adjusts density without rebuilding anything. density 1 = full desktop
++   * scene (the default, unchanged); lower values trim particles, floating
++   * panels, wireframes, code walls and network pulses.
++   */
++  function setQuality(density: number) {
++    const reduced = density < 1;
++    pGeo.setDrawRange(0, Math.floor(PARTICLE_TOTAL * density));
++    pulseGeo.setDrawRange(0, Math.floor(PULSES * Math.max(density, 0.4)));
++    huds.forEach((h, i) => (h.group.visible = !reduced || i % 4 < 2));
++    shapes.forEach(({ mesh }, i) => (mesh.visible = !reduced || i % 2 === 0));
++    glyphPlanes.forEach((m, i) => (m.visible = !reduced || i % 2 === 0));
++  }
++
+   return {
+     scene,
+     update,
++    setQuality,
+     /** Point-size scale; pass the render-target height in pixels. */
+     setViewportHeight(h: number) {
+       particleMat.uniforms.uScale.value = h * 0.55;
+diff --git a/src/app/components/BeyondTheScreen/room.ts b/src/app/components/BeyondTheScreen/room.ts
+index 7f03f6d..000d1be 100644
+--- a/src/app/components/BeyondTheScreen/room.ts
++++ b/src/app/components/BeyondTheScreen/room.ts
+@@ -554,6 +554,12 @@ export function createRoom(screenMaterial: THREE.Material) {
+     }
+   }
+ 
++  /** Shadow maps are the single most expensive part of the room on phones. */
++  function setQuality(shadows: boolean) {
++    hallSpot.castShadow = shadows;
++    keySpot.castShadow = shadows;
++  }
++
+   // Receive shadows on everything static
+   group.traverse((o) => {
+     const mesh = o as THREE.Mesh;
+@@ -564,5 +570,5 @@ export function createRoom(screenMaterial: THREE.Material) {
+ 
+   setDoor(0);
+ 
+-  return { group, screen, setDoor, update };
++  return { group, screen, setDoor, update, setQuality };
+ }
+diff --git a/src/app/components/BeyondTheScreen/scene.ts b/src/app/components/BeyondTheScreen/scene.ts
+index 1e2aea2..27ff322 100644
+--- a/src/app/components/BeyondTheScreen/scene.ts
++++ b/src/app/components/BeyondTheScreen/scene.ts
+@@ -21,6 +21,33 @@ export const DEPTH_PRE_MAX = 10;
+ export const DEPTH_MAIN_MAX = DEPTH_MAX - DEPTH_PRE_MAX;
+ 
+ const RT_FOV = 58;
++
++/** Rendering budget. Desktop values are the original, unchanged settings. */
++interface QualityProfile {
++  mobile: boolean;
++  maxPixelRatio: number;
++  density: number; // particles / panels / wireframes (1 = full)
++  shadows: boolean;
++  rtWidth: number; // portal render-target width
++  rtSamples: number; // portal MSAA samples
++  terminalInterval: number; // seconds between terminal redraws
++}
++
++const DESKTOP: QualityProfile = {
++  mobile: false, maxPixelRatio: 1.5, density: 1, shadows: true,
++  rtWidth: 1536, rtSamples: 4, terminalInterval: 0.07,
++};
++const MOBILE: QualityProfile = {
++  mobile: true, maxPixelRatio: 1.25, density: 0.45, shadows: false,
++  rtWidth: 1024, rtSamples: 2, terminalInterval: 0.1,
++};
++
++function detectProfile(): QualityProfile {
++  const narrow = window.matchMedia("(max-width: 820px)").matches;
++  const coarse = window.matchMedia("(pointer: coarse)").matches;
++  const smallSide = Math.min(window.innerWidth, window.innerHeight) <= 820;
++  return narrow || (coarse && smallSide) ? MOBILE : DESKTOP;
++}
+ const rad = THREE.MathUtils.degToRad;
+ const deg = THREE.MathUtils.radToDeg;
+ 
+@@ -99,12 +126,15 @@ export function createScene(container: HTMLElement) {
+   const floatOk =
+     renderer.extensions.has("EXT_color_buffer_float") ||
+     renderer.extensions.has("EXT_color_buffer_half_float");
+-  const RT_W = 1536;
+-  const RT_H = Math.round(RT_W / SCREEN_ASPECT);
+-  const rt = new THREE.WebGLRenderTarget(RT_W, RT_H, {
+-    samples: 4,
+-    type: floatOk ? THREE.HalfFloatType : THREE.UnsignedByteType,
+-  });
++  let profile = detectProfile();
++  const rt = new THREE.WebGLRenderTarget(
++    profile.rtWidth,
++    Math.round(profile.rtWidth / SCREEN_ASPECT),
++    {
++      samples: profile.rtSamples,
++      type: floatOk ? THREE.HalfFloatType : THREE.UnsignedByteType,
++    }
++  );
+ 
+   // ---------- Content ----------
+   const terminal = createTerminal();
+@@ -209,6 +239,15 @@ export function createScene(container: HTMLElement) {
+     walkCurve.getPoint(w, camPos);
+     lookCurve.getPoint(w, lookAt);
+ 
++    // Portrait phones: the horizontal field of view is narrow, so stand a
++    // little further back at the door and walk closer to the laptop. This is
++    // zero for any landscape aspect, leaving desktop framing untouched.
++    const portrait = THREE.MathUtils.clamp((1 - roomCam.aspect) / 0.4, 0, 1);
++    if (portrait > 0) {
++      camPos.z += 0.8 * portrait * (1 - smoothstep(0, 0.3, w));
++      camPos.lerp(screenCenter, 0.16 * portrait * smoothstep(0.55, 1, w));
++    }
++
+     if (state.approach > 0) {
+       const e = THREE.MathUtils.clamp(state.approach, 0, 1);
+       const t = Math.tan(rad(roomCam.fov / 2));
+@@ -248,10 +287,54 @@ export function createScene(container: HTMLElement) {
+     return THREE.MathUtils.lerp(matched, target, smoothstep(DEPTH_PRE_MAX, 70, depth));
+   }
+ 
+-  // ---------- Resize ----------
++  // ---------- Quality, resize ----------
++  // Adaptive fallback: if a phone sustains < ~33 fps we drop to 1x pixel
++  // ratio and a lighter scene. Never applies to the desktop profile.
++  let degraded = false;
++  let reducedMotion = false;
++  let needsFrame = true;
++  let qualityKey = "";
++  let rtHeight = Math.round(profile.rtWidth / SCREEN_ASPECT);
++
++  function applyQuality() {
++    profile = detectProfile();
++    const useLite = profile.mobile && degraded;
++    const key = `${profile.mobile}|${useLite}|${window.devicePixelRatio}`;
++    if (key === qualityKey) return;
++    qualityKey = key;
++
++    const pr = useLite
++      ? 1
++      : Math.min(window.devicePixelRatio || 1, profile.maxPixelRatio);
++    if (renderer.getPixelRatio() !== pr) renderer.setPixelRatio(pr);
++
++    digital.setQuality(profile.density * (useLite ? 0.7 : 1));
++    room.setQuality(profile.shadows);
++
++    const rtW = useLite ? 768 : profile.rtWidth;
++    if (rt.width !== rtW) {
++      rtHeight = Math.round(rtW / SCREEN_ASPECT);
++      rt.setSize(rtW, rtHeight);
++    }
++    if (rt.samples !== profile.rtSamples) {
++      rt.samples = profile.rtSamples;
++      rt.dispose(); // re-allocated lazily with the new sample count
++    }
++    needsFrame = true;
++  }
++
++  let lastW = 0;
++  let lastH = 0;
++
++  /** Cheap and idempotent: safe to call from resize, orientationchange and
++   *  ResizeObserver without ever rebuilding the scene. */
+   function resize() {
++    applyQuality();
+     const { w, h } = size();
+-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
++    if (w === lastW && h === lastH) return;
++    lastW = w;
++    lastH = h;
++
+     renderer.setSize(w, h, false);
+     canvas.style.width = "100%";
+     canvas.style.height = "100%";
+@@ -262,24 +345,62 @@ export function createScene(container: HTMLElement) {
+         ? 42
+         : Math.min(72, deg(2 * Math.atan(Math.tan(rad(21)) * (1.2 / aspect))));
+     roomCam.updateProjectionMatrix();
++    needsFrame = true;
++  }
++
++  function setReducedMotion(value: boolean) {
++    reducedMotion = value;
++    needsFrame = true;
+   }
+ 
+   // ---------- Render ----------
+   let lastTerminal = -1;
+   let renderedOnce = false;
++  let lastKey = "";
++  let lastFrameAt = performance.now();
++  let frameEma = 16;
++  let slowFrames = 0;
+ 
+   function isDirect() {
+     return state.approach >= 0.999 && state.mix >= 0.999;
+   }
+ 
+-  function render(time: number) {
++  function watchPerformance() {
++    const now = performance.now();
++    const dt = now - lastFrameAt;
++    lastFrameAt = now;
++    if (dt > 250) return; // ignore tab-switch / scroll-jank gaps
++    frameEma = frameEma * 0.95 + dt * 0.05;
++    if (!profile.mobile || degraded) return;
++    slowFrames = frameEma > 30 ? slowFrames + 1 : Math.max(0, slowFrames - 2);
++    if (slowFrames > 150) {
++      degraded = true;
++      applyQuality();
++    }
++  }
++
++  function render(rawTime: number) {
++    const t = reducedMotion ? 0 : rawTime;
+     const { w, h } = size();
+     const pr = renderer.getPixelRatio();
+ 
++    if (reducedMotion) {
++      // Nothing animates on its own: only draw when scroll/size changed.
++      const key = [
++        state.door, state.walk, state.approach, state.mix,
++        state.depthPre, state.depthMain, w, h, pr,
++      ].join("|");
++      if (key === lastKey && !needsFrame) return;
++      lastKey = key;
++    } else {
++      watchPerformance();
++    }
++    needsFrame = false;
++
+     if (isDirect()) {
+       // The screen now fills the viewport: render the digital world on its own.
+       const depth = state.depthPre + state.depthMain;
+-      digital.update(time);
++      digital.update(t);
+       digital.setViewportHeight(h * pr);
+       digCam.aspect = w / h;
+       digCam.fov = directFov(depth, digCam.aspect);
+@@ -291,19 +412,22 @@ export function createScene(container: HTMLElement) {
+     }
+ 
+     room.setDoor(state.door);
+-    room.update(time);
++    room.update(t);
+     screenMaterial.uniforms.uMix.value = state.mix;
+-    screenMaterial.uniforms.uTime.value = time;
++    screenMaterial.uniforms.uTime.value = t;
+ 
+     // The terminal is only visible once the door has started to open.
+-    if ((state.door > 0.02 || !renderedOnce) && time - lastTerminal > 0.07) {
+-      lastTerminal = time;
+-      terminal.draw(time);
++    if (
++      (state.door > 0.02 || !renderedOnce) &&
++      t - lastTerminal > profile.terminalInterval
++    ) {
++      lastTerminal = t;
++      terminal.draw(t);
+     }
+ 
+     if (state.mix > 0.001) {
+-      digital.update(time);
+-      digital.setViewportHeight(RT_H);
++      digital.update(t);
++      digital.setViewportHeight(rtHeight);
+       digCam.aspect = SCREEN_ASPECT;
+       digCam.fov = RT_FOV;
+       digCam.updateProjectionMatrix();
+@@ -333,7 +457,7 @@ export function createScene(container: HTMLElement) {
+     canvas.remove();
+   }
+ 
+-  return { state, domElement: canvas, resize, render, dispose };
++  return { state, domElement: canvas, resize, render, setReducedMotion, dispose };
+ }
+ 
+ export type World = ReturnType<typeof createScene>;
+diff --git a/src/app/components/MobileNav.tsx b/src/app/components/MobileNav.tsx
+new file mode 100644
+index 0000000..258546f
+--- /dev/null
++++ b/src/app/components/MobileNav.tsx
+@@ -0,0 +1,65 @@
++"use client";
++
++import { useEffect, useId, useState } from "react";
++import { Menu, X } from "lucide-react";
++
++const links = [
++  { href: "#home", label: "Home" },
++  { href: "#about", label: "About" },
++  { href: "#events", label: "Events" },
++  { href: "#team", label: "Our Team" },
++  { href: "#contact", label: "Contact" },
++];
++
++/**
++ * Touch-friendly menu for narrow screens. The desktop `.nav-links` row is
++ * untouched; this button/panel is only displayed at <= 600px (see globals.css).
++ */
++export default function MobileNav() {
++  const [open, setOpen] = useState(false);
++  const panelId = useId();
++
++  useEffect(() => {
++    if (!open) return;
++    const onKey = (event: KeyboardEvent) => {
++      if (event.key === "Escape") setOpen(false);
++    };
++    const onResize = () => {
++      if (window.innerWidth > 600) setOpen(false);
++    };
++    window.addEventListener("keydown", onKey);
++    window.addEventListener("resize", onResize);
++    return () => {
++      window.removeEventListener("keydown", onKey);
++      window.removeEventListener("resize", onResize);
++    };
++  }, [open]);
++
++  return (
++    <div className="mobile-nav">
++      <button
++        type="button"
++        className="mobile-nav-toggle"
++        aria-expanded={open}
++        aria-controls={panelId}
++        aria-label={open ? "Close menu" : "Open menu"}
++        onClick={() => setOpen((v) => !v)}
++      >
++        {open ? <X size={22} /> : <Menu size={22} />}
++      </button>
++
++      <nav
++        id={panelId}
++        className={`mobile-nav-panel${open ? " is-open" : ""}`}
++        aria-label="Primary"
++        hidden={!open}
++      >
++        {links.map((link) => (
++          <a key={link.href} href={link.href} onClick={() => setOpen(false)}>
++            {link.label}
++          </a>
++        ))}
++      </nav>
++    </div>
++  );
++}
+diff --git a/src/app/globals.css b/src/app/globals.css
+index 3275646..0055080 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -873,6 +873,112 @@ button, a {
+   }
+ }
+ 
++/* MOBILE NAVIGATION (hamburger only exists on narrow screens) */
++
++.mobile-nav {
++  display: none;
++}
++
++html {
++  overflow-x: clip;
++}
++
++@media (max-width: 600px) {
++  /* Keep the nav reachable while scrolling the long journey */
++  .navbar {
++    position: fixed;
++    gap: 10px;
++  }
++
++  .nav-cta {
++    min-height: 44px;
++    margin-left: auto;
++  }
++
++  .mobile-nav {
++    display: block;
++  }
++
++  .mobile-nav-toggle {
++    display: inline-flex;
++    align-items: center;
++    justify-content: center;
++    width: 44px;
++    height: 44px;
++    border-radius: 10px;
++    border: 1px solid var(--border);
++    background: rgba(255, 255, 255, 0.04);
++    color: #fff;
++    cursor: pointer;
++    touch-action: manipulation;
++  }
++
++  .mobile-nav-panel {
++    position: absolute;
++    top: 100%;
++    left: 0;
++    right: 0;
++    display: flex;
++    flex-direction: column;
++    padding: 8px 5% 16px;
++    background: rgba(5, 8, 7, 0.985);
++    backdrop-filter: blur(18px);
++    -webkit-backdrop-filter: blur(18px);
++    border-bottom: 1px solid var(--border);
++  }
++
++  .mobile-nav-panel[hidden] {
++    display: none;
++  }
++
++  .mobile-nav-panel a {
++    display: flex;
++    align-items: center;
++    min-height: 52px;
++    font-size: 16px;
++    color: #d6dbe8;
++    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
++    touch-action: manipulation;
++  }
++
++  .mobile-nav-panel a:last-child {
++    border-bottom: 0;
++  }
++
++  /* "Scroll to explore" collided with the buttons: flow it after them */
++  .hero-bottom {
++    position: static;
++    margin-top: 32px;
++  }
++
++  .hero h1 {
++    word-break: normal;
++    overflow-wrap: anywhere;
++  }
++
++  .community-glow {
++    max-width: 100vw;
++  }
++
++  .footer {
++    overflow-wrap: anywhere;
++  }
++}
++
++/* Short landscape phones: shrink the hero so copy and door both fit */
++@media (max-height: 480px) and (orientation: landscape) {
++  .hero {
++    min-height: 0;
++    padding-top: 110px;
++    padding-bottom: 60px;
++  }
++
++  .hero h1 {
++    font-size: clamp(40px, 9vh, 64px);
++    letter-spacing: -2px;
++  }
++}
++
+ /* ACCESSIBILITY: REDUCE MOTION */
+ 
+ @media (prefers-reduced-motion: reduce) {
+@@ -1007,10 +1113,13 @@ main {
+ 
+ .beyond-screen-background {
+   position: fixed;
+-  inset: 0;
++  top: 0;
++  left: 0;
+   width: 100%;
++  /* lvh (not dvh): the canvas keeps one size while the mobile address bar
++     slides in and out, so the camera framing never jumps. */
+   height: 100vh;
+-  height: 100dvh;
++  height: 100lvh;
+   z-index: 0;
+   overflow: hidden;
+   pointer-events: none;
+diff --git a/src/app/page.tsx b/src/app/page.tsx
+index e4f1ba1..3adb8ec 100644
+--- a/src/app/page.tsx
++++ b/src/app/page.tsx
+@@ -1,4 +1,5 @@
+ 
++import MobileNav from "./components/MobileNav";
+ import {
+   ArrowDown,
+   ArrowRight,
+@@ -79,6 +80,8 @@ export default function Home() {
+         <a href="#events" className="nav-cta">
+           Explore events <ArrowUpRight size={15} />
+         </a>
++
++        <MobileNav />
+       </header>
+ 
+       {/* HERO */}
+-- 
+2.43.0
+
