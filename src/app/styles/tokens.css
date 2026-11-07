@@ -1,0 +1,23 @@
+
+/* Design tokens — charcoal, off-white, one restrained emerald. */
+:root {
+  --bg: #0a0b0a;
+  --bg-2: #0e100f;
+  --ink: #ece9e2;
+  --ink-2: rgba(236, 233, 226, 0.66);
+  --ink-3: rgba(236, 233, 226, 0.4);
+  --line: rgba(236, 233, 226, 0.13);
+  --line-2: rgba(236, 233, 226, 0.26);
+  --em: #3fae83;
+  --em-dim: rgba(63, 174, 131, 0.35);
+
+  --f-display: "Instrument Serif", "Times New Roman", serif;
+  --f-body: "Instrument Sans Variable", system-ui, sans-serif;
+  --f-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+
+  --gutter: clamp(20px, 4.5vw, 72px);
+  --max: 1320px;
+  --sec-y: clamp(88px, 14vh, 176px);
+  --ease: cubic-bezier(0.22, 0.7, 0.2, 1);
+  --nav-h: 68px;
+}

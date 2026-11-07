@@ -1,0 +1,256 @@
+
+/* =========================================================
+   OPENING — cinematic intro, hero and scroll journey
+   ========================================================= */
+
+.opening {
+  position: relative;
+  isolation: isolate;
+}
+
+.journey {
+  position: relative;
+  width: 100%;
+}
+
+.journey--room {
+  min-height: 400svh;
+}
+
+.journey--digital {
+  min-height: 500svh;
+}
+
+.beat {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 100svh;
+  padding: 100px var(--gutter);
+}
+
+.beat--hero {
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: calc(var(--nav-h) + 60px);
+}
+
+.eyebrow {
+  margin: 0 0 28px;
+  color: var(--em);
+  font-family: var(--f-mono);
+  font-size: 10px;
+  letter-spacing: .16em;
+  line-height: 1.6;
+  text-transform: uppercase;
+}
+
+.hero__title {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  font-family: var(--f-display);
+  font-size: clamp(76px, 13vw, 190px);
+  font-weight: 400;
+  letter-spacing: -.055em;
+  line-height: .78;
+}
+
+.hero__title span {
+  display: block;
+}
+
+.hero__accent {
+  color: var(--em);
+  font-style: italic;
+}
+
+.hero__desc {
+  max-width: 430px;
+  margin: 38px 0 0;
+  color: var(--ink-2);
+  font-size: clamp(14px, 1.2vw, 17px);
+  line-height: 1.8;
+}
+
+.hero__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 32px;
+}
+
+.hero__scroll {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: clamp(48px, 9vh, 100px);
+  color: var(--ink-3);
+  font-family: var(--f-mono);
+  font-size: 9px;
+  letter-spacing: .15em;
+}
+
+.hero__scroll i {
+  position: relative;
+  display: inline-block;
+  width: 42px;
+  height: 1px;
+  background: var(--em);
+}
+
+.hero__scroll i::after {
+  position: absolute;
+  top: -3px;
+  right: 0;
+  width: 7px;
+  height: 7px;
+  border-top: 1px solid var(--em);
+  border-right: 1px solid var(--em);
+  content: "";
+  transform: rotate(45deg);
+}
+
+.hero__side {
+  position: absolute;
+  right: var(--gutter);
+  bottom: 110px;
+  color: var(--ink-3);
+  font-family: var(--f-mono);
+  font-size: 9px;
+  letter-spacing: .18em;
+  writing-mode: vertical-rl;
+}
+
+.beat--cap {
+  align-items: flex-start;
+}
+
+.beat--right {
+  align-items: flex-end;
+  text-align: right;
+}
+
+.cap {
+  max-width: 650px;
+  margin: 0;
+  font-family: var(--f-display);
+  font-size: clamp(42px, 7vw, 104px);
+  font-weight: 400;
+  letter-spacing: -.035em;
+  line-height: .98;
+}
+
+.cap::first-letter {
+  color: var(--em);
+}
+
+.beat--gate {
+  align-items: center;
+  text-align: center;
+}
+
+.beat--gate .eyebrow {
+  margin-bottom: 24px;
+}
+
+.gate__link {
+  display: inline-flex;
+  align-items: center;
+  gap: 24px;
+  padding: 18px 0;
+  border-bottom: 1px solid var(--line-2);
+  font-family: var(--f-display);
+  font-size: clamp(32px, 5vw, 64px);
+  line-height: 1;
+  transition: color .3s, border-color .3s;
+}
+
+.gate__link span {
+  color: var(--em);
+  font-family: var(--f-mono);
+  font-size: 20px;
+  transition: transform .3s var(--ease);
+}
+
+.gate__link:hover {
+  color: var(--em);
+  border-color: var(--em);
+}
+
+.gate__link:hover span {
+  transform: translateY(6px);
+}
+
+/* Responsive */
+@media (max-width: 700px) {
+  .journey--room {
+    min-height: 400svh;
+  }
+
+  .journey--digital {
+    min-height: 500svh;
+  }
+
+  .beat {
+    padding: 80px var(--gutter);
+  }
+
+  .beat--hero {
+    padding-top: calc(var(--nav-h) + 40px);
+  }
+
+  .hero__title {
+    font-size: clamp(64px, 16vw, 112px);
+    line-height: .84;
+  }
+
+  .hero__desc {
+    max-width: 340px;
+    margin-top: 28px;
+  }
+
+  .hero__actions {
+    gap: 10px;
+  }
+
+  .hero__side {
+    right: var(--gutter);
+    bottom: 42px;
+    font-size: 8px;
+  }
+
+  .hero__scroll {
+    margin-top: 56px;
+  }
+
+  .cap {
+    max-width: 90%;
+    font-size: clamp(38px, 10vw, 64px);
+  }
+
+  .gate__link {
+    gap: 14px;
+    font-size: clamp(30px, 8vw, 44px);
+  }
+}
+
+@media (max-width: 380px) {
+  .hero__title {
+    font-size: 15vw;
+  }
+
+  .hero__actions .btn {
+    gap: 12px;
+    padding-inline: 14px;
+    font-size: 9px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .gate__link,
+  .gate__link span {
+    transition: none;
+  }
+}

@@ -1,11 +1,11 @@
-
+import type { ReactNode } from "react";
 import { SITE } from "../data/site";
 
 function Beat({
   children,
   className = "",
 }: {
-  children: React.ReactNode;
+  children: ReactNode;
   className?: string;
 }) {
   return <div className={`beat ${className}`}>{children}</div>;

@@ -1,0 +1,146 @@
+
+.nav {
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 50;
+}
+
+.nav__bar {
+  display: flex;
+  align-items: center;
+  gap: 32px;
+  height: var(--nav-h);
+  padding: 0 var(--gutter);
+  border-bottom: 1px solid transparent;
+  transition: background .4s, border-color .4s, backdrop-filter .4s;
+}
+
+.nav.is-solid .nav__bar,
+.nav.is-open .nav__bar {
+  background: rgba(10, 11, 10, .86);
+  backdrop-filter: blur(10px);
+  border-color: var(--line);
+}
+
+.nav__links {
+  display: flex;
+  gap: 28px;
+  margin-left: auto;
+}
+
+.nav__links a {
+  font-family: var(--f-mono);
+  font-size: 11px;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--ink-2);
+  padding: 6px 0;
+  border-bottom: 1px solid transparent;
+  transition: color .25s, border-color .25s;
+}
+
+.nav__links a:hover,
+.nav__links a[aria-current="true"] {
+  color: var(--ink);
+  border-color: var(--em);
+}
+
+.nav__cta {
+  font-family: var(--f-mono);
+  font-size: 11px;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  padding: 10px 16px;
+  border: 1px solid var(--line-2);
+  transition: border-color .3s, color .3s;
+}
+
+.nav__cta:hover {
+  border-color: var(--em);
+  color: var(--em);
+}
+
+.burger {
+  display: none;
+  margin-left: auto;
+  width: 44px;
+  height: 44px;
+  background: none;
+  border: 0;
+  position: relative;
+  cursor: pointer;
+}
+
+.burger span {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  height: 1px;
+  background: var(--ink);
+  transition: transform .3s var(--ease), top .3s var(--ease);
+}
+
+.burger span:first-child { top: 18px; }
+.burger span:last-child { top: 26px; }
+
+.is-open .burger span:first-child {
+  top: 22px;
+  transform: rotate(45deg);
+}
+
+.is-open .burger span:last-child {
+  top: 22px;
+  transform: rotate(-45deg);
+}
+
+.menu { display: none; }
+
+@media (max-width: 960px) {
+  .nav__links,
+  .nav__cta { display: none; }
+
+  .burger { display: block; }
+
+  .menu:not([hidden]) {
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    position: fixed;
+    inset: var(--nav-h) 0 0;
+    padding: 24px var(--gutter) 32px;
+    background: var(--bg);
+    overflow-y: auto;
+  }
+
+  .menu nav {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .menu a {
+    display: flex;
+    align-items: baseline;
+    gap: 18px;
+    padding: 18px 0;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--f-display);
+    font-size: 42px;
+    line-height: 1;
+  }
+
+  .menu a em {
+    font-family: var(--f-mono);
+    font-style: normal;
+    font-size: 11px;
+    color: var(--em);
+    letter-spacing: .12em;
+  }
+
+  .menu p {
+    font-family: var(--f-mono);
+    font-size: 11px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--ink-3);
+  }
+}

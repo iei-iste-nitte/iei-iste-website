@@ -179,7 +179,7 @@ export default function ScrollDepthBackground() {
     scene.add(architecture);
 
     // Building arrangement
-    for (let side of [-1, 1]) {
+    for (const side of [-1, 1]) {
       for (let i = 0; i < 24; i++) {
         const z = -18 - i * 4.3;
         const width = 2.2 + ((i * 7) % 4) * 0.45;
